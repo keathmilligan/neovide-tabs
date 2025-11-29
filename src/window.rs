@@ -45,6 +45,11 @@ const POSITION_UPDATE_TIMER_ID: usize = 3;
 /// Delay before updating position after external move/resize (ms)
 const POSITION_UPDATE_DELAY_MS: u32 = 100;
 
+/// Timer ID for polling Neovide process status
+const PROCESS_POLL_TIMER_ID: usize = 4;
+/// Interval for polling Neovide process status (ms) - spec requires detection within 500ms
+const PROCESS_POLL_INTERVAL_MS: u32 = 250;
+
 // Tab bar layout constants
 /// Width of each tab in pixels
 const TAB_WIDTH: i32 = 120;
@@ -885,6 +890,10 @@ unsafe extern "system" fn window_proc(
             });
             let state_ptr = Box::into_raw(state);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+
+            // Start the process polling timer to detect when Neovide processes exit
+            SetTimer(hwnd, PROCESS_POLL_TIMER_ID, PROCESS_POLL_INTERVAL_MS, None);
+
             LRESULT(0)
         }
 
@@ -1160,13 +1169,19 @@ unsafe extern "system" fn window_proc(
 
         WM_EXITSIZEMOVE => {
             // User finished dragging or resizing - now reposition all Neovide windows
+            // and bring the selected one to the foreground
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 state.in_size_move = false;
+                // Update positions for all tabs (so switching tabs later works correctly)
                 state
                     .tab_manager
                     .update_all_positions(hwnd, TITLEBAR_HEIGHT);
+                // Activate the selected tab (show + bring to foreground)
+                state
+                    .tab_manager
+                    .activate_and_foreground_selected(hwnd, TITLEBAR_HEIGHT);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
@@ -1219,6 +1234,38 @@ unsafe extern "system" fn window_proc(
                             .update_all_positions(hwnd, TITLEBAR_HEIGHT);
                     }
                 }
+            } else if wparam.0 == PROCESS_POLL_TIMER_ID {
+                // Poll for exited Neovide processes
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+
+                    // Find all tabs whose processes have exited
+                    let exited_indices = state.tab_manager.find_exited_tabs();
+
+                    if !exited_indices.is_empty() {
+                        let mut should_close = false;
+
+                        // Remove exited tabs (indices are in reverse order for safe removal)
+                        for index in exited_indices {
+                            if state.tab_manager.remove_exited_tab(index) {
+                                // This was the last tab
+                                should_close = true;
+                                break;
+                            }
+                        }
+
+                        if should_close {
+                            // Last tab's process exited - close the application
+                            KillTimer(hwnd, PROCESS_POLL_TIMER_ID).ok();
+                            PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+                        } else {
+                            // Activate the newly selected tab and repaint
+                            state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
+                            InvalidateRect(hwnd, None, false);
+                        }
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -1262,7 +1309,11 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_CLOSE => {
-            // Terminate all Neovide processes
+            // Stop the process polling timer
+            KillTimer(hwnd, PROCESS_POLL_TIMER_ID).ok();
+
+            // Terminate all Neovide processes spawned by this application
+            // (only processes tracked via Child handles are terminated)
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
                 let mut state = Box::from_raw(state_ptr);

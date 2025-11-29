@@ -123,12 +123,10 @@ impl NeovideProcess {
             }
         });
 
-        // Monitor process in background thread
-        thread::spawn(move || {
-            if let Some(mut child) = child_clone.lock().unwrap().take() {
-                let _ = child.wait();
-            }
-        });
+        // Note: We no longer use a background thread to wait on the child process.
+        // Instead, we poll the process status via is_running() and try_wait().
+        // The child_clone is no longer needed since we keep the child in the Arc<Mutex>.
+        drop(child_clone);
 
         Ok(NeovideProcess {
             child: child_arc,
@@ -147,13 +145,18 @@ impl NeovideProcess {
         Ok(())
     }
 
-    /// Check if the Neovide process is still running
-    #[allow(dead_code)]
+    /// Check if the Neovide process is still running.
+    /// Returns true if the process is still running, false if it has exited or was never started.
     pub fn is_running(&self) -> bool {
         if let Some(child) = self.child.lock().unwrap().as_mut() {
-            child.try_wait().ok().flatten().is_none()
+            // try_wait() returns Ok(Some(status)) if exited, Ok(None) if still running
+            match child.try_wait() {
+                Ok(Some(_status)) => false, // Process has exited
+                Ok(None) => true,           // Process is still running
+                Err(_) => false,            // Error checking status, assume not running
+            }
         } else {
-            false
+            false // No child process (already terminated or never started)
         }
     }
 

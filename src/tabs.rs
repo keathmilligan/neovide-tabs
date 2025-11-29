@@ -248,6 +248,44 @@ impl TabManager {
     pub fn iter(&self) -> impl Iterator<Item = (usize, &Tab)> {
         self.tabs.iter().enumerate()
     }
+
+    /// Find indices of tabs whose Neovide processes have exited.
+    /// Returns indices in reverse order (highest first) to allow safe removal.
+    pub fn find_exited_tabs(&self) -> Vec<usize> {
+        let mut exited = Vec::new();
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if !tab.process.is_running() {
+                exited.push(i);
+            }
+        }
+        // Reverse so we can remove from highest index first without invalidating lower indices
+        exited.reverse();
+        exited
+    }
+
+    /// Remove a tab without terminating its process (for already-exited processes).
+    /// Returns true if this was the last tab.
+    pub fn remove_exited_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+
+        // Just remove the tab - don't call terminate() since process already exited
+        self.tabs.remove(index);
+
+        if self.tabs.is_empty() {
+            return true;
+        }
+
+        // Adjust selected index if needed
+        if self.selected_index >= self.tabs.len() {
+            self.selected_index = self.tabs.len() - 1;
+        } else if self.selected_index > index {
+            self.selected_index -= 1;
+        }
+
+        false
+    }
 }
 
 impl Default for TabManager {
