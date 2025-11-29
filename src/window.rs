@@ -10,10 +10,11 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
+    BITMAP, BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
     CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect,
-    HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY,
-    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    GetObjectW, GetTextMetricsW, HBITMAP, HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo,
+    MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY, STRETCH_HALFTONE, ScreenToClient, SelectObject,
+    SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, TEXTMETRICW, TRANSPARENT, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -24,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::config::{Config, Profile};
+use crate::icons::{ICON_SIZE, get_icon_bitmap};
 use crate::tabs::{DragState, TabManager};
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("NeovideTabsWindow");
@@ -595,11 +597,12 @@ fn calculate_swap_target(
 }
 
 /// Paint a single tab
-#[allow(unused_must_use)]
+#[allow(unused_must_use, clippy::too_many_arguments)]
 fn paint_tab(
     hdc: windows::Win32::Graphics::Gdi::HDC,
     tab_rect: &RECT,
     label: &str,
+    icon_filename: Option<&str>,
     is_selected: bool,
     is_hovered: bool,
     close_hovered: bool,
@@ -631,6 +634,22 @@ fn paint_tab(
         SelectObject(hdc, old_pen);
         DeleteObject(HGDIOBJ(outline_pen.0));
 
+        // Calculate icon position (centered vertically, with padding from left)
+        let icon_x = tab_rect.left + 6;
+        let icon_y = (tab_rect.top + tab_rect.bottom - ICON_SIZE) / 2;
+
+        // Draw icon if available
+        let label_offset = if let Some(filename) = icon_filename {
+            if let Some(hbitmap) = get_icon_bitmap(filename) {
+                paint_icon(hdc, hbitmap, icon_x, icon_y, ICON_SIZE, ICON_SIZE);
+                ICON_SIZE + 4 // Icon width + padding
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
         // Draw tab label
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
@@ -647,9 +666,15 @@ fn paint_tab(
         let font = CreateFontIndirectW(&lf);
         let old_font = SelectObject(hdc, HGDIOBJ(font.0));
 
-        // Label position (left-aligned with padding, leaving room for close button)
-        let label_x = tab_rect.left + 8;
-        let label_y = (tab_rect.top + tab_rect.bottom - 12) / 2;
+        // Get actual text metrics for proper vertical centering
+        let mut tm = TEXTMETRICW::default();
+        GetTextMetricsW(hdc, &mut tm);
+        let text_height = tm.tmHeight;
+
+        // Label position (after icon, leaving room for close button)
+        // Center text vertically using actual text height
+        let label_x = tab_rect.left + 6 + label_offset;
+        let label_y = (tab_rect.top + tab_rect.bottom - text_height) / 2;
         let label_wide: Vec<u16> = label.encode_utf16().collect();
         TextOutW(hdc, label_x, label_y, &label_wide);
 
@@ -682,6 +707,61 @@ fn paint_tab(
 
         SelectObject(hdc, old_pen);
         DeleteObject(HGDIOBJ(close_pen.0));
+    }
+}
+
+/// Paint an icon bitmap to the device context
+#[allow(unused_must_use)]
+fn paint_icon(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    hbitmap: HBITMAP,
+    x: i32,
+    y: i32,
+    dest_width: i32,
+    dest_height: i32,
+) {
+    unsafe {
+        // Get bitmap dimensions
+        let mut bm = BITMAP::default();
+        let bm_size = std::mem::size_of::<BITMAP>() as i32;
+        if GetObjectW(
+            HGDIOBJ(hbitmap.0),
+            bm_size,
+            Some(&mut bm as *mut _ as *mut std::ffi::c_void),
+        ) == 0
+        {
+            return;
+        }
+
+        // Create compatible DC for the bitmap
+        let mem_dc = CreateCompatibleDC(hdc);
+        if mem_dc.is_invalid() {
+            return;
+        }
+
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(hbitmap.0));
+
+        // Set stretch mode for better quality
+        SetStretchBltMode(hdc, STRETCH_HALFTONE);
+
+        // Stretch blit the bitmap to the destination
+        StretchBlt(
+            hdc,
+            x,
+            y,
+            dest_width,
+            dest_height,
+            mem_dc,
+            0,
+            0,
+            bm.bmWidth,
+            bm.bmHeight,
+            SRCCOPY,
+        );
+
+        // Clean up
+        SelectObject(mem_dc, old_bitmap);
+        DeleteDC(mem_dc);
     }
 }
 
@@ -986,6 +1066,13 @@ unsafe extern "system" fn dropdown_proc(
                             DeleteObject(HGDIOBJ(hover_brush.0));
                         }
 
+                        // Draw icon
+                        let icon_x = item_rect.left + 4;
+                        let icon_y = (item_rect.top + item_rect.bottom - ICON_SIZE) / 2;
+                        if let Some(hbitmap) = get_icon_bitmap(&profile.icon) {
+                            paint_icon(hdc, hbitmap, icon_x, icon_y, ICON_SIZE, ICON_SIZE);
+                        }
+
                         // Draw text
                         SetBkMode(hdc, TRANSPARENT);
                         SetTextColor(hdc, COLORREF(0x00FFFFFF));
@@ -1002,8 +1089,14 @@ unsafe extern "system" fn dropdown_proc(
                         let font = CreateFontIndirectW(&lf);
                         let old_font = SelectObject(hdc, HGDIOBJ(font.0));
 
-                        let text_x = item_rect.left + 24;
-                        let text_y = (item_rect.top + item_rect.bottom - 12) / 2;
+                        // Get actual text metrics for proper vertical centering
+                        let mut tm = TEXTMETRICW::default();
+                        GetTextMetricsW(hdc, &mut tm);
+                        let text_height = tm.tmHeight;
+
+                        // Text position after icon, vertically centered
+                        let text_x = item_rect.left + ICON_SIZE + 8;
+                        let text_y = (item_rect.top + item_rect.bottom - text_height) / 2;
                         let name_wide: Vec<u16> = profile.name.encode_utf16().collect();
                         TextOutW(hdc, text_x, text_y, &name_wide);
 
@@ -1134,11 +1227,13 @@ fn paint_tab_bar(
         let is_hovered = matches!(hovered_tab, HoveredTab::Tab(idx) if idx == i);
         let close_hovered = matches!(hovered_tab, HoveredTab::TabClose(idx) if idx == i);
         let label = tab_manager.get_tab_label(i);
+        let icon = tab_manager.get_tab_icon(i);
 
         paint_tab(
             hdc,
             &tab_rect,
             &label,
+            icon,
             is_selected,
             is_hovered,
             close_hovered,
@@ -1184,12 +1279,14 @@ fn paint_tab_bar(
 
             let is_selected = drag_index == selected_index;
             let label = tab_manager.get_tab_label(drag_index);
+            let icon = tab_manager.get_tab_icon(drag_index);
 
             // Dragged tab is never hovered (we're dragging it)
             paint_tab(
                 hdc,
                 &drag_rect,
                 &label,
+                icon,
                 is_selected,
                 false,
                 false,

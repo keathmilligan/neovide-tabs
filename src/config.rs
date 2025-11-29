@@ -42,7 +42,6 @@ pub struct Profile {
     /// Profile name
     pub name: String,
     /// Icon filename (just the filename, not full path)
-    #[allow(dead_code)]
     pub icon: String,
     /// Working directory (resolved full path)
     pub working_directory: PathBuf,

@@ -2,6 +2,7 @@
 #![cfg(target_os = "windows")]
 
 mod config;
+mod icons;
 mod process;
 mod tabs;
 mod window;

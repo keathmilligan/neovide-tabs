@@ -15,6 +15,11 @@ pub struct Tab {
     pub process: NeovideProcess,
     /// Profile name used to create this tab
     pub profile_name: String,
+    /// Profile icon filename
+    pub profile_icon: String,
+    /// Profile working directory (for tooltip display)
+    #[allow(dead_code)]
+    pub working_directory: std::path::PathBuf,
     /// Profile index in the config (for reference)
     pub profile_index: usize,
 }
@@ -126,6 +131,8 @@ impl TabManager {
             id: self.next_id,
             process,
             profile_name: profile.name.clone(),
+            profile_icon: profile.icon.clone(),
+            working_directory: profile.working_directory.clone(),
             profile_index,
         };
         self.next_id += 1;
@@ -152,6 +159,8 @@ impl TabManager {
             id: self.next_id,
             process,
             profile_name: "Default".to_string(),
+            profile_icon: crate::config::DEFAULT_ICON.to_string(),
+            working_directory: dirs::home_dir().unwrap_or_default(),
             profile_index: 0,
         };
         self.next_id += 1;
@@ -336,6 +345,19 @@ impl TabManager {
     #[allow(dead_code)]
     pub fn get_tab_profile_index(&self, index: usize) -> Option<usize> {
         self.tabs.get(index).map(|tab| tab.profile_index)
+    }
+
+    /// Get the icon filename for a tab
+    pub fn get_tab_icon(&self, index: usize) -> Option<&str> {
+        self.tabs.get(index).map(|tab| tab.profile_icon.as_str())
+    }
+
+    /// Get the working directory for a tab (for tooltip display)
+    #[allow(dead_code)]
+    pub fn get_tab_working_directory(&self, index: usize) -> Option<&std::path::Path> {
+        self.tabs
+            .get(index)
+            .map(|tab| tab.working_directory.as_path())
     }
 
     /// Iterate over all tabs with their indices

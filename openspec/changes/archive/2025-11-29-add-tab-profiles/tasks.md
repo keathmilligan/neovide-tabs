@@ -10,11 +10,11 @@
 - [x] 1.7 Write unit tests for profile parsing, defaults, and Default profile generation
 
 ## 2. Icon Loading and Caching
-- [ ] 2.1 Create icon loading utility that loads PNG/BMP from `~/.config/neovide-tabs/icons/`
-- [ ] 2.2 Implement icon caching to avoid repeated disk reads
-- [ ] 2.3 Create fallback icon (embedded or runtime-generated) for missing icon files
-- [ ] 2.4 Add icon bitmap to Profile struct or create separate icon cache indexed by filename
-- [ ] 2.5 Write unit tests for icon path resolution
+- [x] 2.1 Create icon loading utility that loads PNG/BMP from `~/.config/neovide-tabs/icons/`
+- [x] 2.2 Implement icon caching to avoid repeated disk reads
+- [x] 2.3 Create fallback icon (embedded or runtime-generated) for missing icon files
+- [x] 2.4 Add icon bitmap to Profile struct or create separate icon cache indexed by filename
+- [x] 2.5 Write unit tests for icon path resolution
 
 ## 3. Working Directory Support
 - [x] 3.1 Modify `NeovideProcess::spawn()` to accept optional working directory parameter
@@ -26,13 +26,13 @@
 - [x] 4.1 Add profile reference (name and index) to `Tab` struct in `src/tabs.rs`
 - [x] 4.2 Modify `TabManager::create_tab()` to accept profile parameter
 - [x] 4.3 Update `get_tab_label()` to return profile name instead of "Tab N"
-- [ ] 4.4 Add method to get profile icon for a tab
+- [x] 4.4 Add method to get profile icon for a tab
 
 ## 5. Tab Display Updates
-- [ ] 5.1 Modify `paint_tab()` in `src/window.rs` to render profile icon
-- [ ] 5.2 Adjust tab label positioning to account for icon (icon left, name right)
-- [ ] 5.3 Implement icon scaling/rendering using Win32 GDI (16x16 in tab)
-- [ ] 5.4 Implement tab tooltip showing profile name and working directory
+- [x] 5.1 Modify `paint_tab()` in `src/window.rs` to render profile icon
+- [x] 5.2 Adjust tab label positioning to account for icon (icon left, name right)
+- [x] 5.3 Implement icon scaling/rendering using Win32 GDI (16x16 in tab)
+- [x] 5.4 Implement tab tooltip showing profile name and working directory
 
 ## 6. Profile Dropdown Button
 - [x] 6.1 Add dropdown button constants (width, position relative to + button)
