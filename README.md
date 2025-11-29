@@ -26,7 +26,6 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 
 ### Installing Neovide
 
-**Windows:**
 ```bash
 # Using winget
 winget install Neovide.Neovide
@@ -36,23 +35,6 @@ scoop install neovide
 
 # Or download from releases
 # https://github.com/neovide/neovide/releases
-```
-
-**Linux:**
-```bash
-# Using cargo
-cargo install neovide
-
-# Or use your distribution's package manager
-```
-
-**macOS:**
-```bash
-# Using Homebrew
-brew install neovide
-
-# Using cargo
-cargo install neovide
 ```
 
 ## Getting Started
