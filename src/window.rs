@@ -17,6 +17,11 @@ const FOREGROUND_TIMER_ID: usize = 2;
 /// Delay before bringing Neovide to foreground (ms)
 const FOREGROUND_DELAY_MS: u32 = 50;
 
+/// Timer ID for deferred position update (for external tools like FancyZones)
+const POSITION_UPDATE_TIMER_ID: usize = 3;
+/// Delay before updating position after external move/resize (ms)
+const POSITION_UPDATE_DELAY_MS: u32 = 100;
+
 /// Application state stored in window user data
 struct WindowState {
     neovide_process: Option<NeovideProcess>,
@@ -145,13 +150,14 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_ENTERSIZEMOVE => {
-            // User started dragging or resizing - set flag and cancel any pending foreground timer
+            // User started dragging or resizing - set flag and cancel any pending timers
             let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
             if !state_ptr.is_null() {
                 let state = unsafe { &mut *state_ptr };
                 state.in_size_move = true;
                 unsafe {
                     KillTimer(hwnd, FOREGROUND_TIMER_ID).ok();
+                    KillTimer(hwnd, POSITION_UPDATE_TIMER_ID).ok();
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -214,8 +220,43 @@ unsafe extern "system" fn window_proc(
                         process.bring_to_foreground();
                     }
                 }
+            } else if wparam.0 == POSITION_UPDATE_TIMER_ID {
+                unsafe {
+                    KillTimer(hwnd, POSITION_UPDATE_TIMER_ID).ok();
+                }
+
+                // Deferred position update for external tools (e.g., FancyZones)
+                let state_ptr =
+                    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+                if !state_ptr.is_null() {
+                    let state = unsafe { &*state_ptr };
+                    if !state.in_size_move
+                        && let Some(ref process) = state.neovide_process
+                    {
+                        process.update_position(hwnd);
+                    }
+                }
             }
             LRESULT(0)
+        }
+
+        WM_WINDOWPOSCHANGED => {
+            // Handle programmatic window position/size changes (e.g., from FancyZones)
+            // Only schedule update if we're not in a manual size/move operation
+            // Use a timer to debounce and avoid interfering with resize operations
+            let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = unsafe { &*state_ptr };
+                if !state.in_size_move && state.neovide_process.is_some() {
+                    // Schedule a deferred position update - this will be cancelled
+                    // if more WM_WINDOWPOSCHANGED messages arrive, effectively debouncing
+                    unsafe {
+                        SetTimer(hwnd, POSITION_UPDATE_TIMER_ID, POSITION_UPDATE_DELAY_MS, None);
+                    }
+                }
+            }
+            // Must call DefWindowProcW to get WM_SIZE and WM_MOVE messages
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
         WM_GETMINMAXINFO => {
