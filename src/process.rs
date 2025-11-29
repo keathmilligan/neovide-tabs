@@ -13,6 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
+use crate::window::CONTENT_INSET;
+
 /// Manages the lifecycle of a Neovide process instance
 pub struct NeovideProcess {
     child: Arc<Mutex<Option<Child>>>,
@@ -397,7 +399,7 @@ pub fn debug_list_windows(search: &str) {
     }
 }
 
-/// Move and resize a window to fill the parent's content area (below title bar)
+/// Move and resize a window to fill the parent's content area (below title bar, with inset)
 fn move_window_to_parent_content_area(
     neovide_hwnd: HWND,
     parent_hwnd: HWND,
@@ -409,10 +411,10 @@ fn move_window_to_parent_content_area(
         windows::Win32::UI::WindowsAndMessaging::GetClientRect(parent_hwnd, &mut client_rect)
             .context("Failed to get parent client rect")?;
 
-        // Convert top-left of content area (below title bar) to screen coordinates
+        // Convert top-left of content area (below title bar, with inset) to screen coordinates
         let mut top_left = windows::Win32::Foundation::POINT {
-            x: client_rect.left,
-            y: client_rect.top + titlebar_height,
+            x: client_rect.left + CONTENT_INSET,
+            y: client_rect.top + titlebar_height + CONTENT_INSET,
         };
 
         let result = windows::Win32::Graphics::Gdi::ClientToScreen(parent_hwnd, &mut top_left);
@@ -420,9 +422,9 @@ fn move_window_to_parent_content_area(
             anyhow::bail!("Failed to convert client to screen coordinates");
         }
 
-        // Target size is the parent's client area size minus title bar height
-        let target_width = client_rect.right - client_rect.left;
-        let target_height = client_rect.bottom - client_rect.top - titlebar_height;
+        // Target size is the parent's client area size minus title bar height and insets
+        let target_width = client_rect.right - client_rect.left - (CONTENT_INSET * 2);
+        let target_height = client_rect.bottom - client_rect.top - titlebar_height - (CONTENT_INSET * 2);
 
         // Get Neovide's current rect for debug output
         let mut neovide_rect = RECT::default();

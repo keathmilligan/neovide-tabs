@@ -6,6 +6,7 @@
 use anyhow::{Context, Result};
 use std::cell::Cell;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
     HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID,
@@ -28,6 +29,8 @@ const WINDOW_TITLE: PCWSTR = w!("neovide-tabs");
 const TITLEBAR_HEIGHT: i32 = 32;
 /// Button width in pixels
 const BUTTON_WIDTH: i32 = 46;
+/// Inset for content area (neovim window) from all edges
+pub const CONTENT_INSET: i32 = 12;
 
 /// Timer ID for delayed foreground activation
 const FOREGROUND_TIMER_ID: usize = 2;
@@ -127,9 +130,12 @@ pub fn create_window() -> Result<HWND> {
             None,
             hinstance,
             None,
-        );
+        )?;
 
-        hwnd.context("Failed to create window")
+        // Enable Windows 11 rounded corners
+        enable_rounded_corners(hwnd);
+
+        Ok(hwnd)
     }
 }
 
@@ -147,14 +153,30 @@ pub fn run_message_loop() -> Result<()> {
     }
 }
 
-/// Get client area dimensions (excluding title bar)
+/// Get content area dimensions (excluding title bar and with inset from all edges)
 fn get_content_rect(hwnd: HWND) -> Result<RECT> {
     unsafe {
         let mut rect = RECT::default();
         GetClientRect(hwnd, &mut rect).context("Failed to get client rect")?;
-        // Content area starts below title bar
-        rect.top = TITLEBAR_HEIGHT;
+        // Content area starts below title bar with inset from all edges
+        rect.left = CONTENT_INSET;
+        rect.top = TITLEBAR_HEIGHT + CONTENT_INSET;
+        rect.right -= CONTENT_INSET;
+        rect.bottom -= CONTENT_INSET;
         Ok(rect)
+    }
+}
+
+/// Enable Windows 11 rounded corners for the window
+fn enable_rounded_corners(hwnd: HWND) {
+    unsafe {
+        let preference = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const std::ffi::c_void,
+            std::mem::size_of_val(&preference) as u32,
+        );
     }
 }
 
