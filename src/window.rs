@@ -10,9 +10,10 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
-    HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID,
-    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreatePen,
+    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, HBRUSH, HGDIOBJ, InvalidateRect,
+    LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY, ScreenToClient, SelectObject,
+    SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -693,31 +694,24 @@ fn paint_tab_bar_bottom_line(
     }
 }
 
-/// Paint the title bar
+/// Paint the title bar content to a device context
 #[allow(unused_must_use)]
-fn paint_titlebar(
+fn paint_titlebar_content(
     hwnd: HWND,
-    ps: &PAINTSTRUCT,
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    client_rect: &RECT,
     background_color: u32,
     hovered_button: HoveredButton,
     hovered_tab: HoveredTab,
     tab_manager: &TabManager,
 ) {
     unsafe {
-        let hdc = ps.hdc;
-
-        // Get client rect
-        let mut client_rect = RECT::default();
-        if GetClientRect(hwnd, &mut client_rect).is_err() {
-            return;
-        }
-
         let client_width = client_rect.right;
 
-        // Fill entire client area with background color to prevent white flashing
+        // Fill entire client area with background color
         let bg_colorref = COLORREF(rgb_to_colorref(background_color));
         let bg_brush = CreateSolidBrush(bg_colorref);
-        FillRect(hdc, &client_rect, bg_brush);
+        FillRect(hdc, client_rect, bg_brush);
         DeleteObject(HGDIOBJ(bg_brush.0));
 
         // Paint tab bar
@@ -799,6 +793,54 @@ fn paint_titlebar(
 
         let _ = SelectObject(hdc, old_pen);
         let _ = DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// Paint the title bar using double-buffering to prevent flicker
+#[allow(unused_must_use)]
+fn paint_titlebar(
+    hwnd: HWND,
+    ps: &PAINTSTRUCT,
+    background_color: u32,
+    hovered_button: HoveredButton,
+    hovered_tab: HoveredTab,
+    tab_manager: &TabManager,
+) {
+    unsafe {
+        let hdc = ps.hdc;
+
+        // Get client rect
+        let mut client_rect = RECT::default();
+        if GetClientRect(hwnd, &mut client_rect).is_err() {
+            return;
+        }
+
+        let width = client_rect.right - client_rect.left;
+        let height = client_rect.bottom - client_rect.top;
+
+        // Create off-screen buffer for double-buffering
+        let mem_dc = CreateCompatibleDC(hdc);
+        let mem_bitmap = CreateCompatibleBitmap(hdc, width, height);
+        let old_bitmap = SelectObject(mem_dc, HGDIOBJ(mem_bitmap.0));
+
+        // Paint everything to the off-screen buffer
+        paint_titlebar_content(
+            hwnd,
+            mem_dc,
+            &client_rect,
+            background_color,
+            hovered_button,
+            hovered_tab,
+            tab_manager,
+        );
+
+        // Copy the off-screen buffer to the screen in one operation
+        BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
+
+        // Clean up
+        SelectObject(mem_dc, old_bitmap);
+        DeleteObject(HGDIOBJ(mem_bitmap.0));
+        DeleteDC(mem_dc);
     }
 }
 
@@ -1205,7 +1247,7 @@ unsafe extern "system" fn window_proc(
 
         WM_SIZE => {
             // Invalidate the window to repaint title bar (maximize/restore button may change)
-            InvalidateRect(hwnd, None, true);
+            InvalidateRect(hwnd, None, false);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
@@ -1270,7 +1312,7 @@ unsafe extern "system" fn window_proc(
                             } else {
                                 // Activate the newly selected tab (with proper position check)
                                 state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
-                                InvalidateRect(hwnd, None, true);
+                                InvalidateRect(hwnd, None, false);
                             }
                         }
                         TabHitResult::NewTabButton => {
@@ -1289,7 +1331,7 @@ unsafe extern "system" fn window_proc(
                                                 tab.process.hide();
                                             }
                                         }
-                                        InvalidateRect(hwnd, None, true);
+                                        InvalidateRect(hwnd, None, false);
                                     }
                                     Err(e) => {
                                         let error_msg = format!("Failed to create new tab: {}", e);
@@ -1319,13 +1361,13 @@ unsafe extern "system" fn window_proc(
                     if drag.is_active() {
                         // Drag completed - tabs have already been swapped during drag
                         // Just repaint to show final positions
-                        InvalidateRect(hwnd, None, true);
+                        InvalidateRect(hwnd, None, false);
                     } else {
                         // This was a click, not a drag - select the tab
                         if state.tab_manager.select_tab(drag.tab_index) {
                             // Selection changed - activate with proper position check
                             state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
-                            InvalidateRect(hwnd, None, true);
+                            InvalidateRect(hwnd, None, false);
                         } else {
                             // Already selected - just ensure it's in foreground (no reposition)
                             state
@@ -1387,8 +1429,8 @@ unsafe extern "system" fn window_proc(
                         }
                     }
 
-                    // Repaint for drag feedback
-                    InvalidateRect(hwnd, None, true);
+                    // Repaint for drag feedback (false = don't erase, we use double-buffering)
+                    InvalidateRect(hwnd, None, false);
                 } else if state.tab_manager.drag_state.is_none() {
                     // Not dragging - update hover state
                     let mut client_rect = RECT::default();
