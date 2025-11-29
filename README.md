@@ -2,6 +2,8 @@
 
 A lightweight wrapper application for [Neovide](https://neovide.dev) that embeds Neovide instances within a host window (Windows only).
 
+![neovide-tabs screenshot](screenshot.png)
+
 ## Overview
 
 neovide-tabs provides a native wrapper window for Neovide by embedding a frameless Neovide window into a host application. The Neovide window automatically fills the wrapper's client area and maintains focus synchronization.

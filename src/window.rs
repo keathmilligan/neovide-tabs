@@ -423,19 +423,14 @@ fn paint_tab(
         FillRect(hdc, tab_rect, tab_brush);
         DeleteObject(HGDIOBJ(tab_brush.0));
 
-        // Draw outline around tab
+        // Draw outline around tab (top, left, right - bottom is handled by tab bar line)
         let outline_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
         let old_pen = SelectObject(hdc, HGDIOBJ(outline_pen.0));
 
-        // Draw tab outline (top, left, right; bottom only if not selected)
         MoveToEx(hdc, tab_rect.left, tab_rect.bottom, None);
         LineTo(hdc, tab_rect.left, tab_rect.top);
         LineTo(hdc, tab_rect.right - 1, tab_rect.top);
         LineTo(hdc, tab_rect.right - 1, tab_rect.bottom);
-        if !is_selected {
-            MoveToEx(hdc, tab_rect.left, tab_rect.bottom - 1, None);
-            LineTo(hdc, tab_rect.right, tab_rect.bottom - 1);
-        }
 
         SelectObject(hdc, old_pen);
         DeleteObject(HGDIOBJ(outline_pen.0));
@@ -535,6 +530,7 @@ fn paint_tab_bar(
     background_color: u32,
 ) {
     let max_x = get_tab_bar_max_x(client_width);
+    let selected_index = tab_manager.selected_index();
 
     for (i, _tab) in tab_manager.iter() {
         let tab_rect = get_tab_rect(i, client_width);
@@ -542,7 +538,7 @@ fn paint_tab_bar(
             break; // Overflow
         }
 
-        let is_selected = i == tab_manager.selected_index();
+        let is_selected = i == selected_index;
         let is_hovered = matches!(hovered_tab, HoveredTab::Tab(idx) if idx == i);
         let close_hovered = matches!(hovered_tab, HoveredTab::TabClose(idx) if idx == i);
         let label = tab_manager.get_tab_label(i);
@@ -563,6 +559,47 @@ fn paint_tab_bar(
     if new_tab_rect.right <= max_x {
         let is_hovered = matches!(hovered_tab, HoveredTab::NewTabButton);
         paint_new_tab_button(hdc, &new_tab_rect, is_hovered);
+    }
+
+    // Draw line at the bottom of the tab bar with a gap for the selected tab
+    // This creates the illusion of physical tabbed pages
+    paint_tab_bar_bottom_line(hdc, tab_manager, client_width);
+}
+
+/// Paint the bottom line of the tab bar with a gap for the selected tab
+#[allow(unused_must_use)]
+fn paint_tab_bar_bottom_line(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    tab_manager: &TabManager,
+    client_width: i32,
+) {
+    unsafe {
+        let outline_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
+        let old_pen = SelectObject(hdc, HGDIOBJ(outline_pen.0));
+
+        // The bottom line is at TITLEBAR_HEIGHT - 1 (bottom of tab area)
+        let line_y = TITLEBAR_HEIGHT - 1;
+        let line_start_x = 0;
+        let line_end_x = client_width;
+
+        // Get the selected tab rect to create a gap
+        let selected_index = tab_manager.selected_index();
+        let selected_rect = get_tab_rect(selected_index, client_width);
+
+        // Draw line from left edge to start of selected tab
+        if selected_rect.left > line_start_x {
+            MoveToEx(hdc, line_start_x, line_y, None);
+            LineTo(hdc, selected_rect.left, line_y);
+        }
+
+        // Draw line from end of selected tab to right edge
+        if selected_rect.right < line_end_x {
+            MoveToEx(hdc, selected_rect.right - 1, line_y, None);
+            LineTo(hdc, line_end_x, line_y);
+        }
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(outline_pen.0));
     }
 }
 
@@ -592,26 +629,6 @@ fn paint_titlebar(
         let bg_brush = CreateSolidBrush(bg_colorref);
         FillRect(hdc, &client_rect, bg_brush);
         DeleteObject(HGDIOBJ(bg_brush.0));
-
-        // Draw content area outline
-        let content_rect = RECT {
-            left: CONTENT_INSET - 1,
-            top: TITLEBAR_HEIGHT + CONTENT_INSET - 1,
-            right: client_rect.right - CONTENT_INSET + 1,
-            bottom: client_rect.bottom - CONTENT_INSET + 1,
-        };
-        let outline_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
-        let old_pen = SelectObject(hdc, HGDIOBJ(outline_pen.0));
-
-        // Draw content area outline rectangle
-        MoveToEx(hdc, content_rect.left, content_rect.top, None);
-        LineTo(hdc, content_rect.right, content_rect.top);
-        LineTo(hdc, content_rect.right, content_rect.bottom);
-        LineTo(hdc, content_rect.left, content_rect.bottom);
-        LineTo(hdc, content_rect.left, content_rect.top);
-
-        SelectObject(hdc, old_pen);
-        DeleteObject(HGDIOBJ(outline_pen.0));
 
         // Paint tab bar
         paint_tab_bar(
