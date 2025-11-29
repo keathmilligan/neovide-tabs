@@ -47,7 +47,7 @@ impl NeovideProcess {
             .arg(format!("{}x{}", width, height));
 
         let child = cmd.spawn().context("Failed to spawn Neovide process")?;
-        
+
         // Get the process ID to find the correct window later
         let child_pid = child.id();
 
@@ -159,13 +159,37 @@ impl NeovideProcess {
 
     /// Update the Neovide window position and size to match parent's content area
     /// (client area minus title bar)
-    pub fn update_position(&self, parent_hwnd: HWND, titlebar_height: i32) {
+    /// Returns true if the window was actually moved, false if already in position or not ready
+    pub fn update_position(&self, parent_hwnd: HWND, titlebar_height: i32) -> bool {
         if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
             let neovide_hwnd = HWND(hwnd_raw as *mut _);
-            if let Err(e) =
-                move_window_to_parent_content_area(neovide_hwnd, parent_hwnd, titlebar_height)
-            {
-                eprintln!("Failed to update Neovide position: {}", e);
+            match move_window_to_parent_content_area(neovide_hwnd, parent_hwnd, titlebar_height) {
+                Ok(moved) => moved,
+                Err(e) => {
+                    eprintln!("Failed to update Neovide position: {}", e);
+                    false
+                }
+            }
+        } else {
+            false
+        }
+    }
+
+    /// Update position only if needed, then show and bring to foreground
+    /// This is the proper sequence for activating a tab
+    pub fn activate(&self, parent_hwnd: HWND, titlebar_height: i32) {
+        if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
+            let neovide_hwnd = HWND(hwnd_raw as *mut _);
+
+            // First ensure position is correct (only moves if needed)
+            let _ = move_window_to_parent_content_area(neovide_hwnd, parent_hwnd, titlebar_height);
+
+            unsafe {
+                // Show the window
+                let _ = ShowWindow(neovide_hwnd, SW_SHOW);
+                // Bring to foreground
+                let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(neovide_hwnd);
+                let _ = windows::Win32::UI::WindowsAndMessaging::BringWindowToTop(neovide_hwnd);
             }
         }
     }
@@ -176,6 +200,7 @@ impl NeovideProcess {
     }
 
     /// Bring the Neovide window to the foreground
+    #[allow(dead_code)]
     pub fn bring_to_foreground(&self) {
         if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
             let neovide_hwnd = HWND(hwnd_raw as *mut _);
@@ -189,6 +214,7 @@ impl NeovideProcess {
     }
 
     /// Show the Neovide window
+    #[allow(dead_code)]
     pub fn show(&self) {
         if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
             let neovide_hwnd = HWND(hwnd_raw as *mut _);
@@ -284,7 +310,10 @@ unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPAR
         GetWindowThreadProcessId(hwnd, Some(&mut process_id));
 
         // If we're looking for a specific PID, check it
-        if context.target_pid.is_some_and(|target_pid| process_id != target_pid) {
+        if context
+            .target_pid
+            .is_some_and(|target_pid| process_id != target_pid)
+        {
             return BOOL(1); // Continue enumeration - wrong process
         }
 
@@ -309,7 +338,7 @@ unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPAR
 /// Find a Neovide window by exact title "Neovide" and class "Window Class"
 #[allow(dead_code)]
 fn find_neovide_window() -> Option<WindowInfo> {
-    let mut context = NeovideSearchContext { 
+    let mut context = NeovideSearchContext {
         result: None,
         target_pid: None,
     };
@@ -324,7 +353,7 @@ fn find_neovide_window() -> Option<WindowInfo> {
 
 /// Find a Neovide window by process ID
 fn find_neovide_window_by_pid(pid: u32) -> Option<WindowInfo> {
-    let mut context = NeovideSearchContext { 
+    let mut context = NeovideSearchContext {
         result: None,
         target_pid: Some(pid),
     };
@@ -448,12 +477,8 @@ pub fn debug_list_windows(search: &str) {
     }
 }
 
-/// Move and resize a window to fill the parent's content area (below title bar, with inset)
-fn move_window_to_parent_content_area(
-    neovide_hwnd: HWND,
-    parent_hwnd: HWND,
-    titlebar_height: i32,
-) -> Result<()> {
+/// Calculate the target position and size for a Neovide window within the parent's content area
+fn calculate_target_rect(parent_hwnd: HWND, titlebar_height: i32) -> Result<(i32, i32, i32, i32)> {
     unsafe {
         // Get parent window's client area
         let mut client_rect = RECT::default();
@@ -476,19 +501,49 @@ fn move_window_to_parent_content_area(
         let target_height =
             client_rect.bottom - client_rect.top - titlebar_height - (CONTENT_INSET * 2);
 
-        // Get Neovide's current rect for debug output
+        Ok((top_left.x, top_left.y, target_width, target_height))
+    }
+}
+
+/// Move and resize a window to fill the parent's content area (below title bar, with inset)
+/// Returns true if the window was actually moved, false if it was already in position
+fn move_window_to_parent_content_area(
+    neovide_hwnd: HWND,
+    parent_hwnd: HWND,
+    titlebar_height: i32,
+) -> Result<bool> {
+    unsafe {
+        let (target_x, target_y, target_width, target_height) =
+            calculate_target_rect(parent_hwnd, titlebar_height)?;
+
+        // Get Neovide's current rect
         let mut neovide_rect = RECT::default();
         GetWindowRect(neovide_hwnd, &mut neovide_rect)
             .context("Failed to get Neovide window rect")?;
 
+        let current_x = neovide_rect.left;
+        let current_y = neovide_rect.top;
+        let current_width = neovide_rect.right - neovide_rect.left;
+        let current_height = neovide_rect.bottom - neovide_rect.top;
+
+        // Check if already in the correct position and size
+        if current_x == target_x
+            && current_y == target_y
+            && current_width == target_width
+            && current_height == target_height
+        {
+            // Already in position, no need to move
+            return Ok(false);
+        }
+
         eprintln!(
             "Moving Neovide: from ({}, {}) size {}x{} to ({}, {}) size {}x{}",
-            neovide_rect.left,
-            neovide_rect.top,
-            neovide_rect.right - neovide_rect.left,
-            neovide_rect.bottom - neovide_rect.top,
-            top_left.x,
-            top_left.y,
+            current_x,
+            current_y,
+            current_width,
+            current_height,
+            target_x,
+            target_y,
             target_width,
             target_height
         );
@@ -497,28 +552,16 @@ fn move_window_to_parent_content_area(
         SetWindowPos(
             neovide_hwnd,
             HWND_TOP,
-            top_left.x,
-            top_left.y,
+            target_x,
+            target_y,
             target_width,
             target_height,
             SWP_NOZORDER,
         )
         .context("SetWindowPos failed")?;
 
-        // Verify the move and resize
-        GetWindowRect(neovide_hwnd, &mut neovide_rect)
-            .context("Failed to get Neovide window rect after move")?;
-
-        eprintln!(
-            "After move: pos=({}, {}), size={}x{}",
-            neovide_rect.left,
-            neovide_rect.top,
-            neovide_rect.right - neovide_rect.left,
-            neovide_rect.bottom - neovide_rect.top
-        );
+        Ok(true)
     }
-
-    Ok(())
 }
 
 /// Display an error message when Neovide window is not found after timeout

@@ -16,18 +16,25 @@ pub struct Tab {
 /// State for tab drag-and-drop reordering
 #[derive(Debug, Clone)]
 pub struct DragState {
-    /// Index of the tab being dragged
+    /// Index of the tab being dragged (updated in real-time as swaps occur)
     pub tab_index: usize,
     /// Initial mouse X position when drag started
     pub start_x: i32,
     /// Current mouse X position
     pub current_x: i32,
+    /// Original X position of the tab's left edge when drag started
+    pub tab_start_left: i32,
 }
 
 impl DragState {
     /// Check if the drag has moved beyond the threshold to be considered active
     pub fn is_active(&self) -> bool {
         (self.current_x - self.start_x).abs() > 5
+    }
+
+    /// Get the visual X position for the dragged tab
+    pub fn get_visual_x(&self) -> i32 {
+        self.tab_start_left + (self.current_x - self.start_x)
     }
 }
 
@@ -165,14 +172,29 @@ impl TabManager {
         }
     }
 
-    /// Update the position of all Neovide windows
+    /// Update the position of all Neovide windows (only moves if needed)
     pub fn update_all_positions(&self, parent_hwnd: HWND, titlebar_height: i32) {
         for tab in &self.tabs {
             tab.process.update_position(parent_hwnd, titlebar_height);
         }
     }
 
+    /// Activate the selected tab: ensure position, show it, hide others, bring to foreground
+    /// This is the main method for switching tabs
+    pub fn activate_selected(&self, parent_hwnd: HWND, titlebar_height: i32) {
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if i == self.selected_index {
+                // Use the combined activate method which handles position check + show + foreground
+                tab.process.activate(parent_hwnd, titlebar_height);
+            } else {
+                tab.process.hide();
+            }
+        }
+    }
+
     /// Show the selected tab's Neovide window and hide all others
+    /// Note: Prefer activate_selected() when parent_hwnd is available
+    #[allow(dead_code)]
     pub fn show_selected_hide_others(&self) {
         for (i, tab) in self.tabs.iter().enumerate() {
             if i == self.selected_index {
@@ -184,10 +206,18 @@ impl TabManager {
         }
     }
 
-    /// Bring the selected tab's Neovide to foreground
+    /// Bring the selected tab's Neovide to foreground (just foreground, no position check)
+    #[allow(dead_code)]
     pub fn bring_selected_to_foreground(&self) {
         if let Some(tab) = self.selected_tab() {
             tab.process.bring_to_foreground();
+        }
+    }
+
+    /// Activate the selected tab with position check, then bring to foreground
+    pub fn activate_and_foreground_selected(&self, parent_hwnd: HWND, titlebar_height: i32) {
+        if let Some(tab) = self.selected_tab() {
+            tab.process.activate(parent_hwnd, titlebar_height);
         }
     }
 
@@ -247,6 +277,7 @@ mod tests {
             tab_index: 0,
             start_x: 100,
             current_x: 100,
+            tab_start_left: 8,
         };
         assert!(!drag.is_active());
 
@@ -254,6 +285,7 @@ mod tests {
             tab_index: 0,
             start_x: 100,
             current_x: 106,
+            tab_start_left: 8,
         };
         assert!(drag.is_active());
 
@@ -261,7 +293,30 @@ mod tests {
             tab_index: 0,
             start_x: 100,
             current_x: 94,
+            tab_start_left: 8,
         };
         assert!(drag.is_active());
+    }
+
+    #[test]
+    fn test_drag_state_visual_x() {
+        let drag = DragState {
+            tab_index: 0,
+            start_x: 100,
+            current_x: 150,
+            tab_start_left: 8,
+        };
+        // Visual X should be tab_start_left + (current_x - start_x)
+        // = 8 + (150 - 100) = 8 + 50 = 58
+        assert_eq!(drag.get_visual_x(), 58);
+
+        let drag = DragState {
+            tab_index: 1,
+            start_x: 200,
+            current_x: 150,
+            tab_start_left: 128,
+        };
+        // Visual X = 128 + (150 - 200) = 128 - 50 = 78
+        assert_eq!(drag.get_visual_x(), 78);
     }
 }

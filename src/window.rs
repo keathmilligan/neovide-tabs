@@ -381,6 +381,7 @@ fn hit_test_tab_bar(x: i32, y: i32, tab_count: usize, client_width: i32) -> TabH
 }
 
 /// Calculate the target index for dropping a tab at position x
+#[cfg(test)]
 fn calculate_drop_index(x: i32, tab_count: usize, client_width: i32) -> usize {
     let _ = client_width; // Reserved for future dynamic sizing
 
@@ -396,6 +397,52 @@ fn calculate_drop_index(x: i32, tab_count: usize, client_width: i32) -> usize {
     } else {
         index
     }
+}
+
+/// Calculate if a tab swap should occur during drag based on 50% threshold.
+/// Returns Some(target_index) if a swap should occur, None otherwise.
+///
+/// The swap logic:
+/// - When dragging right: swap when the dragged tab's center crosses past the center of the next tab
+/// - When dragging left: swap when the dragged tab's center crosses past the center of the previous tab
+fn calculate_swap_target(
+    drag_tab_index: usize,
+    drag_visual_x: i32,
+    tab_count: usize,
+    _client_width: i32,
+) -> Option<usize> {
+    if tab_count <= 1 {
+        return None;
+    }
+
+    // Calculate the center of the dragged tab at its visual position
+    let drag_center = drag_visual_x + TAB_WIDTH / 2;
+
+    // Check swap with the tab to the right
+    if drag_tab_index < tab_count - 1 {
+        let right_tab_index = drag_tab_index + 1;
+        let right_tab_rect = get_tab_rect(right_tab_index, 0);
+        let right_tab_center = (right_tab_rect.left + right_tab_rect.right) / 2;
+
+        // If dragged tab center is past the right tab's center, swap right
+        if drag_center > right_tab_center {
+            return Some(right_tab_index);
+        }
+    }
+
+    // Check swap with the tab to the left
+    if drag_tab_index > 0 {
+        let left_tab_index = drag_tab_index - 1;
+        let left_tab_rect = get_tab_rect(left_tab_index, 0);
+        let left_tab_center = (left_tab_rect.left + left_tab_rect.right) / 2;
+
+        // If dragged tab center is past the left tab's center (to the left), swap left
+        if drag_center < left_tab_center {
+            return Some(left_tab_index);
+        }
+    }
+
+    None
 }
 
 /// Paint a single tab
@@ -531,8 +578,17 @@ fn paint_tab_bar(
 ) {
     let max_x = get_tab_bar_max_x(client_width);
     let selected_index = tab_manager.selected_index();
+    let drag_state = &tab_manager.drag_state;
 
+    // First pass: paint all non-dragged tabs in their normal positions
     for (i, _tab) in tab_manager.iter() {
+        // Skip the dragged tab - we'll paint it last so it appears on top
+        if let Some(drag) = drag_state {
+            if drag.is_active() && i == drag.tab_index {
+                continue;
+            }
+        }
+
         let tab_rect = get_tab_rect(i, client_width);
         if tab_rect.left > max_x {
             break; // Overflow
@@ -564,6 +620,40 @@ fn paint_tab_bar(
     // Draw line at the bottom of the tab bar with a gap for the selected tab
     // This creates the illusion of physical tabbed pages
     paint_tab_bar_bottom_line(hdc, tab_manager, client_width);
+
+    // Second pass: paint the dragged tab at its visual position (on top of everything)
+    if let Some(drag) = drag_state {
+        if drag.is_active() {
+            let drag_index = drag.tab_index;
+            let visual_x = drag.get_visual_x();
+
+            // Clamp the visual position to stay within the tab bar bounds
+            let min_x = TAB_BAR_LEFT_MARGIN;
+            let max_tab_x = TAB_BAR_LEFT_MARGIN + ((tab_manager.count() - 1) as i32 * TAB_WIDTH);
+            let clamped_x = visual_x.clamp(min_x, max_tab_x.max(min_x));
+
+            let drag_rect = RECT {
+                left: clamped_x,
+                top: TAB_VERTICAL_PADDING,
+                right: clamped_x + TAB_WIDTH,
+                bottom: TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING,
+            };
+
+            let is_selected = drag_index == selected_index;
+            let label = tab_manager.get_tab_label(drag_index);
+
+            // Dragged tab is never hovered (we're dragging it)
+            paint_tab(
+                hdc,
+                &drag_rect,
+                &label,
+                is_selected,
+                false,
+                false,
+                background_color,
+            );
+        }
+    }
 }
 
 /// Paint the bottom line of the tab bar with a gap for the selected tab
@@ -1068,7 +1158,10 @@ unsafe extern "system" fn window_proc(
                 if !state_ptr.is_null() {
                     let state = &*state_ptr;
                     if !state.in_size_move {
-                        state.tab_manager.bring_selected_to_foreground();
+                        // Use activate which checks position first, then brings to foreground
+                        state
+                            .tab_manager
+                            .activate_and_foreground_selected(hwnd, TITLEBAR_HEIGHT);
                     }
                 }
             } else if wparam.0 == POSITION_UPDATE_TIMER_ID {
@@ -1157,11 +1250,13 @@ unsafe extern "system" fn window_proc(
 
                     match tab_hit {
                         TabHitResult::Tab(index) => {
-                            // Start potential drag
+                            // Start potential drag - get the tab's initial position
+                            let tab_rect = get_tab_rect(index, client_width);
                             state.tab_manager.drag_state = Some(DragState {
                                 tab_index: index,
                                 start_x: x,
                                 current_x: x,
+                                tab_start_left: tab_rect.left,
                             });
                             // Capture mouse for drag tracking
                             SetCapture(hwnd);
@@ -1173,8 +1268,8 @@ unsafe extern "system" fn window_proc(
                                 // Last tab closed - close the window
                                 PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
                             } else {
-                                // Show the newly selected tab
-                                state.tab_manager.show_selected_hide_others();
+                                // Activate the newly selected tab (with proper position check)
+                                state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
                                 InvalidateRect(hwnd, None, true);
                             }
                         }
@@ -1186,8 +1281,14 @@ unsafe extern "system" fn window_proc(
 
                                 match state.tab_manager.create_tab(width, height, hwnd) {
                                     Ok(_) => {
-                                        // Show the new tab, hide others
-                                        state.tab_manager.show_selected_hide_others();
+                                        // Hide other tabs immediately
+                                        // The new tab will be activated by the spawner thread
+                                        // once the window is ready
+                                        for (i, tab) in state.tab_manager.iter() {
+                                            if i != state.tab_manager.selected_index() {
+                                                tab.process.hide();
+                                            }
+                                        }
                                         InvalidateRect(hwnd, None, true);
                                     }
                                     Err(e) => {
@@ -1205,7 +1306,7 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_LBUTTONUP => {
-            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let _x = (lparam.0 & 0xFFFF) as i16 as i32;
             let _y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
 
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
@@ -1216,25 +1317,20 @@ unsafe extern "system" fn window_proc(
                     ReleaseCapture().ok();
 
                     if drag.is_active() {
-                        // Complete the drag - calculate target position
-                        let mut client_rect = RECT::default();
-                        if GetClientRect(hwnd, &mut client_rect).is_ok() {
-                            let client_width = client_rect.right;
-                            let target_index =
-                                calculate_drop_index(x, state.tab_manager.count(), client_width);
-                            if target_index != drag.tab_index {
-                                state.tab_manager.move_tab(drag.tab_index, target_index);
-                            }
-                        }
+                        // Drag completed - tabs have already been swapped during drag
+                        // Just repaint to show final positions
                         InvalidateRect(hwnd, None, true);
                     } else {
                         // This was a click, not a drag - select the tab
                         if state.tab_manager.select_tab(drag.tab_index) {
-                            state.tab_manager.show_selected_hide_others();
+                            // Selection changed - activate with proper position check
+                            state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
                             InvalidateRect(hwnd, None, true);
                         } else {
-                            // Already selected, just bring to foreground
-                            state.tab_manager.bring_selected_to_foreground();
+                            // Already selected - just ensure it's in foreground (no reposition)
+                            state
+                                .tab_manager
+                                .activate_and_foreground_selected(hwnd, TITLEBAR_HEIGHT);
                         }
                     }
                 }
@@ -1250,14 +1346,50 @@ unsafe extern "system" fn window_proc(
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
 
-                // Update drag state if dragging
-                if let Some(ref mut drag) = state.tab_manager.drag_state {
+                // Check if we're dragging and extract needed info
+                let drag_info = if let Some(ref mut drag) = state.tab_manager.drag_state {
                     drag.current_x = x;
                     if drag.is_active() {
-                        // Repaint for drag feedback
-                        InvalidateRect(hwnd, None, true);
+                        Some((drag.tab_index, drag.get_visual_x()))
+                    } else {
+                        None
                     }
                 } else {
+                    None
+                };
+
+                // Handle active drag - check for swaps
+                if let Some((current_tab_index, visual_x)) = drag_info {
+                    let tab_count = state.tab_manager.count();
+                    let mut client_rect = RECT::default();
+                    if GetClientRect(hwnd, &mut client_rect).is_ok() {
+                        let client_width = client_rect.right;
+
+                        if let Some(target_index) = calculate_swap_target(
+                            current_tab_index,
+                            visual_x,
+                            tab_count,
+                            client_width,
+                        ) {
+                            // Perform the swap
+                            state.tab_manager.move_tab(current_tab_index, target_index);
+
+                            // Update drag state to track the new position
+                            if let Some(ref mut drag) = state.tab_manager.drag_state {
+                                drag.tab_index = target_index;
+                                // Update tab_start_left to the new slot position
+                                let new_slot_rect = get_tab_rect(target_index, client_width);
+                                drag.tab_start_left = new_slot_rect.left;
+                                // Recalculate start_x to maintain visual continuity
+                                // The tab should stay where it visually is
+                                drag.start_x = x - (visual_x - new_slot_rect.left);
+                            }
+                        }
+                    }
+
+                    // Repaint for drag feedback
+                    InvalidateRect(hwnd, None, true);
+                } else if state.tab_manager.drag_state.is_none() {
                     // Not dragging - update hover state
                     let mut client_rect = RECT::default();
                     if GetClientRect(hwnd, &mut client_rect).is_ok() {
@@ -1497,5 +1629,49 @@ mod tests {
 
         // Position before first tab
         assert_eq!(calculate_drop_index(0, tab_count, width), 0);
+    }
+
+    #[test]
+    fn test_calculate_swap_target() {
+        let width = 1024;
+        let tab_count = 3;
+
+        // Tab at index 0, visual position at its normal spot - no swap
+        let tab0_rect = get_tab_rect(0, width);
+        assert_eq!(
+            calculate_swap_target(0, tab0_rect.left, tab_count, width),
+            None
+        );
+
+        // Tab at index 0, dragged right past center of tab 1 - should swap to index 1
+        let tab1_rect = get_tab_rect(1, width);
+        let tab1_center = (tab1_rect.left + tab1_rect.right) / 2;
+        // Position where tab 0's center is past tab 1's center
+        let visual_x = tab1_center - TAB_WIDTH / 2 + 1;
+        assert_eq!(
+            calculate_swap_target(0, visual_x, tab_count, width),
+            Some(1)
+        );
+
+        // Tab at index 1, dragged left past center of tab 0 - should swap to index 0
+        let tab0_center = (tab0_rect.left + tab0_rect.right) / 2;
+        // Position where tab 1's center is past tab 0's center (to the left)
+        let visual_x = tab0_center - TAB_WIDTH / 2 - 1;
+        assert_eq!(
+            calculate_swap_target(1, visual_x, tab_count, width),
+            Some(0)
+        );
+
+        // Tab at index 0 (leftmost) - can't swap left
+        let visual_x = -50; // Far left
+        assert_eq!(calculate_swap_target(0, visual_x, tab_count, width), None);
+
+        // Tab at index 2 (rightmost with 3 tabs) - can't swap right
+        let tab2_rect = get_tab_rect(2, width);
+        let visual_x = tab2_rect.left + TAB_WIDTH * 2; // Far right
+        assert_eq!(calculate_swap_target(2, visual_x, tab_count, width), None);
+
+        // Single tab - no swaps possible
+        assert_eq!(calculate_swap_target(0, 0, 1, width), None);
     }
 }
