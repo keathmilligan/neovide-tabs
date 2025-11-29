@@ -8,10 +8,12 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 
 ## Features
 
+- **Tab Support**: Create, close, and switch between multiple Neovide instances using tabs
+- **Tab Reordering**: Drag tabs to rearrange their order
 - **Window Embedding**: Embeds Neovide with `--frame none` for seamless integration
-- **Automatic Sizing**: Neovide window fills the wrapper's client area and resizes dynamically
-- **Focus Synchronization**: Wrapper window activation automatically focuses the embedded Neovide
-- **Graceful Lifecycle**: Clean process management with proper termination on close
+- **Automatic Sizing**: Neovide windows fill the wrapper's client area and resize dynamically
+- **Focus Synchronization**: Wrapper window activation automatically focuses the active tab's Neovide
+- **Graceful Lifecycle**: Clean process management with proper termination of all tabs on close
 - **Neovide Detection**: Validates Neovide installation at startup with helpful error messages
 - **Debug Utilities**: `list-windows` command for troubleshooting window detection
 
@@ -94,10 +96,19 @@ neovide-tabs
 ```
 
 The application will:
-1. Open a wrapper window (1024x768, minimum 800x600)
-2. Launch Neovide with frameless window mode (`--frame none`)
-3. Position and resize the Neovide window to fill the wrapper's client area
-4. Automatically bring Neovide to foreground when the wrapper is activated
+1. Open a wrapper window (1024x768, minimum 800x600) with a tab bar
+2. Create an initial tab with a Neovide instance (`--frame none`)
+3. Position and resize the Neovide window to fill the content area
+4. Automatically bring the active tab's Neovide to foreground when the wrapper is activated
+
+### Tab Management
+
+- **New Tab**: Click the (+) button to create a new tab with a fresh Neovide instance
+- **Switch Tabs**: Click on a tab to switch to it; its Neovide instance becomes visible
+- **Close Tab**: Click the (x) on a tab to close it and terminate its Neovide process
+- **Reorder Tabs**: Drag tabs to rearrange their order
+
+When the last tab is closed, the application exits.
 
 ### Debug Commands
 
@@ -116,17 +127,18 @@ neovide-tabs help
 
 ## Architecture
 
-The application consists of three main modules:
+The application consists of four main modules:
 
 - **main.rs**: Entry point with CLI argument handling and startup validation
-- **window.rs**: Win32 window management, message loop, and state handling
+- **window.rs**: Win32 window management, message loop, tab bar rendering, and state handling
+- **tabs.rs**: Tab management (TabManager, Tab, DragState) for multiple Neovide instances
 - **process.rs**: Neovide process spawning, window discovery, and positioning
 
 ## Limitations
 
 - **Windows only**: Currently only supports Windows (uses Win32 API directly)
-- **Single instance**: Manages one Neovide instance per wrapper window
-- **No configuration**: All settings are currently hardcoded
+- **No tab persistence**: Tab sessions are not saved across application restarts
+- **Same working directory**: All tabs use the same working directory (where neovide-tabs was launched)
 
 ## Roadmap
 
@@ -136,9 +148,10 @@ The application consists of three main modules:
 - [x] Window embedding and sizing
 - [x] Graceful process lifecycle handling
 - [x] Focus synchronization
-- [ ] Tab bar UI for multiple instances
-- [ ] Tab creation and management
-- [ ] Keyboard shortcuts
+- [x] Tab bar UI for multiple instances
+- [x] Tab creation and management
+- [x] Tab reordering via drag-and-drop
+- [ ] Keyboard shortcuts for tab navigation
 - [ ] Configurable tab behavior (custom working directories)
 - [ ] Persistent tab sessions
 - [ ] Cross-platform support (Linux, macOS)
@@ -165,6 +178,6 @@ Contributions are welcome! Please read the development guidelines in `AGENTS.md`
 
 ## Project Status
 
-**Current Version:** 0.1.0 (Initial Development)
+**Current Version:** 0.2.0 (Tab Support)
 
-This project is in early development. The current implementation provides a working single-Neovide-instance wrapper with automatic window embedding. The next milestone is implementing the tab bar UI to support multiple Neovide instances.
+The application now supports multiple tabs, each hosting an independent Neovide instance. Users can create, close, switch between, and reorder tabs. The next milestone is adding keyboard shortcuts for tab navigation.

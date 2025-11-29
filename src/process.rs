@@ -8,8 +8,8 @@ use std::time::Duration;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, MB_ICONERROR, MB_OK, MessageBoxW,
-    SWP_NOZORDER, SetWindowPos,
+    GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, MB_ICONERROR, MB_OK, MessageBoxW, SW_HIDE,
+    SW_SHOW, SWP_NOZORDER, SetWindowPos, ShowWindow,
 };
 use windows::core::PCWSTR;
 
@@ -47,6 +47,9 @@ impl NeovideProcess {
             .arg(format!("{}x{}", width, height));
 
         let child = cmd.spawn().context("Failed to spawn Neovide process")?;
+        
+        // Get the process ID to find the correct window later
+        let child_pid = child.id();
 
         let child_arc = Arc::new(Mutex::new(Some(child)));
         let child_clone = Arc::clone(&child_arc);
@@ -69,8 +72,8 @@ impl NeovideProcess {
             while attempts < max_attempts {
                 thread::sleep(Duration::from_millis(100));
 
-                // Find the Neovide window by exact title and class match
-                if let Some(info) = find_neovide_window() {
+                // Find the Neovide window by process ID
+                if let Some(info) = find_neovide_window_by_pid(child_pid) {
                     *neovide_hwnd_clone.lock().unwrap() = Some(info.hwnd.0 as usize);
 
                     // Debug output - show window details
@@ -111,7 +114,8 @@ impl NeovideProcess {
 
             if !found {
                 eprintln!(
-                    "Failed to find Neovide window after {} seconds",
+                    "Failed to find Neovide window (PID: {}) after {} seconds",
+                    child_pid,
                     max_attempts / 10
                 );
                 show_neovide_window_timeout_error();
@@ -183,6 +187,26 @@ impl NeovideProcess {
             }
         }
     }
+
+    /// Show the Neovide window
+    pub fn show(&self) {
+        if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
+            let neovide_hwnd = HWND(hwnd_raw as *mut _);
+            unsafe {
+                let _ = ShowWindow(neovide_hwnd, SW_SHOW);
+            }
+        }
+    }
+
+    /// Hide the Neovide window
+    pub fn hide(&self) {
+        if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
+            let neovide_hwnd = HWND(hwnd_raw as *mut _);
+            unsafe {
+                let _ = ShowWindow(neovide_hwnd, SW_HIDE);
+            }
+        }
+    }
 }
 
 impl Drop for NeovideProcess {
@@ -205,6 +229,7 @@ pub struct WindowInfo {
 /// Context for EnumWindows callback - finds Neovide window by exact match
 struct NeovideSearchContext {
     result: Option<WindowInfo>,
+    target_pid: Option<u32>,
 }
 
 /// Context for listing all matching windows
@@ -258,6 +283,11 @@ unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPAR
         let mut process_id: u32 = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut process_id));
 
+        // If we're looking for a specific PID, check it
+        if context.target_pid.is_some_and(|target_pid| process_id != target_pid) {
+            return BOOL(1); // Continue enumeration - wrong process
+        }
+
         // Get window rect
         let mut rect = RECT::default();
         let _ = GetWindowRect(hwnd, &mut rect);
@@ -277,8 +307,27 @@ unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPAR
 }
 
 /// Find a Neovide window by exact title "Neovide" and class "Window Class"
+#[allow(dead_code)]
 fn find_neovide_window() -> Option<WindowInfo> {
-    let mut context = NeovideSearchContext { result: None };
+    let mut context = NeovideSearchContext { 
+        result: None,
+        target_pid: None,
+    };
+
+    unsafe {
+        let context_ptr = &mut context as *mut NeovideSearchContext as isize;
+        let _ = EnumWindows(Some(enum_windows_neovide_callback), LPARAM(context_ptr));
+    }
+
+    context.result
+}
+
+/// Find a Neovide window by process ID
+fn find_neovide_window_by_pid(pid: u32) -> Option<WindowInfo> {
+    let mut context = NeovideSearchContext { 
+        result: None,
+        target_pid: Some(pid),
+    };
 
     unsafe {
         let context_ptr = &mut context as *mut NeovideSearchContext as isize;
@@ -424,7 +473,8 @@ fn move_window_to_parent_content_area(
 
         // Target size is the parent's client area size minus title bar height and insets
         let target_width = client_rect.right - client_rect.left - (CONTENT_INSET * 2);
-        let target_height = client_rect.bottom - client_rect.top - titlebar_height - (CONTENT_INSET * 2);
+        let target_height =
+            client_rect.bottom - client_rect.top - titlebar_height - (CONTENT_INSET * 2);
 
         // Get Neovide's current rect for debug output
         let mut neovide_rect = RECT::default();

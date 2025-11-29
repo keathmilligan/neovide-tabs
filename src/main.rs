@@ -3,6 +3,7 @@
 
 mod config;
 mod process;
+mod tabs;
 mod window;
 
 use anyhow::Result;

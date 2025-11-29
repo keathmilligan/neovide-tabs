@@ -6,7 +6,9 @@
 use anyhow::{Context, Result};
 use std::cell::Cell;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteObject, EndPaint, FillRect,
     HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID,
@@ -15,12 +17,12 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
+    ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::process::NeovideProcess;
+use crate::tabs::{DragState, TabManager};
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("NeovideTabsWindow");
 const WINDOW_TITLE: PCWSTR = w!("neovide-tabs");
@@ -42,6 +44,30 @@ const POSITION_UPDATE_TIMER_ID: usize = 3;
 /// Delay before updating position after external move/resize (ms)
 const POSITION_UPDATE_DELAY_MS: u32 = 100;
 
+// Tab bar layout constants
+/// Width of each tab in pixels
+const TAB_WIDTH: i32 = 120;
+/// Size of the close button within a tab
+const TAB_CLOSE_SIZE: i32 = 16;
+/// Padding around the close button
+const TAB_CLOSE_PADDING: i32 = 8;
+/// Width of the new tab (+) button
+const NEW_TAB_BUTTON_WIDTH: i32 = 32;
+/// Left margin before the first tab
+const TAB_BAR_LEFT_MARGIN: i32 = 8;
+/// Vertical padding for tabs within the titlebar
+const TAB_VERTICAL_PADDING: i32 = 4;
+
+// Tab bar colors
+/// Background color for unselected tabs (slightly darker than titlebar)
+const TAB_UNSELECTED_COLOR: u32 = 0x16161e;
+/// Outline color for tabs and content area
+const TAB_OUTLINE_COLOR: u32 = 0x3d3d3d;
+/// Hover color for tabs (same as button hover)
+const TAB_HOVER_COLOR: u32 = 0x3d3d3d;
+/// Close button hover color (red)
+const TAB_CLOSE_HOVER_COLOR: u32 = 0xe81123;
+
 /// Which title bar button is being hovered
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HoveredButton {
@@ -51,12 +77,41 @@ enum HoveredButton {
     Close,
 }
 
+/// Result of hit testing in the tab bar area
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabHitResult {
+    /// Hit a tab body (index)
+    Tab(usize),
+    /// Hit a tab's close button (index)
+    TabClose(usize),
+    /// Hit the new tab (+) button
+    NewTabButton,
+    /// Hit the caption/drag area
+    Caption,
+    /// Hit nothing in the tab bar
+    None,
+}
+
+/// Which tab bar element is being hovered
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoveredTab {
+    /// No tab element hovered
+    None,
+    /// Hovering over tab body (index)
+    Tab(usize),
+    /// Hovering over tab close button (index)
+    TabClose(usize),
+    /// Hovering over new tab button
+    NewTabButton,
+}
+
 /// Application state stored in window user data
 struct WindowState {
-    neovide_process: Option<NeovideProcess>,
+    tab_manager: TabManager,
     in_size_move: bool,
     background_color: u32,
     hovered_button: HoveredButton,
+    hovered_tab: HoveredTab,
     tracking_mouse: bool,
 }
 
@@ -235,6 +290,282 @@ fn hit_test_buttons(x: i32, y: i32, client_width: i32) -> HoveredButton {
     }
 }
 
+/// Calculate the rectangle for a tab at a given index
+fn get_tab_rect(index: usize, client_width: i32) -> RECT {
+    let _ = client_width; // Reserved for future dynamic sizing
+    let left = TAB_BAR_LEFT_MARGIN + (index as i32 * TAB_WIDTH);
+    RECT {
+        left,
+        top: TAB_VERTICAL_PADDING,
+        right: left + TAB_WIDTH,
+        bottom: TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING,
+    }
+}
+
+/// Calculate the rectangle for a tab's close button
+fn get_tab_close_rect(tab_rect: &RECT) -> RECT {
+    let close_left = tab_rect.right - TAB_CLOSE_PADDING - TAB_CLOSE_SIZE;
+    let close_top = (tab_rect.top + tab_rect.bottom - TAB_CLOSE_SIZE) / 2;
+    RECT {
+        left: close_left,
+        top: close_top,
+        right: close_left + TAB_CLOSE_SIZE,
+        bottom: close_top + TAB_CLOSE_SIZE,
+    }
+}
+
+/// Get the rectangle for the new tab (+) button
+fn get_new_tab_button_rect(tab_count: usize, client_width: i32) -> RECT {
+    let _ = client_width; // Reserved for future dynamic sizing
+    let left = TAB_BAR_LEFT_MARGIN + (tab_count as i32 * TAB_WIDTH);
+    RECT {
+        left,
+        top: TAB_VERTICAL_PADDING,
+        right: left + NEW_TAB_BUTTON_WIDTH,
+        bottom: TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING,
+    }
+}
+
+/// Get the maximum X position for the tab bar (before window buttons)
+fn get_tab_bar_max_x(client_width: i32) -> i32 {
+    client_width - (BUTTON_WIDTH * 3) - 8 // Leave some padding before window buttons
+}
+
+/// Hit test in the tab bar area
+fn hit_test_tab_bar(x: i32, y: i32, tab_count: usize, client_width: i32) -> TabHitResult {
+    // Must be in the titlebar height range
+    if !(TAB_VERTICAL_PADDING..TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING).contains(&y) {
+        // Could still be in the caption area if within titlebar
+        if (0..TITLEBAR_HEIGHT).contains(&y) {
+            return TabHitResult::Caption;
+        }
+        return TabHitResult::None;
+    }
+
+    let max_x = get_tab_bar_max_x(client_width);
+
+    // Check each tab
+    for i in 0..tab_count {
+        let tab_rect = get_tab_rect(i, client_width);
+        if tab_rect.left > max_x {
+            break; // Tab bar overflow
+        }
+        if x >= tab_rect.left && x < tab_rect.right {
+            // Check if on the close button
+            let close_rect = get_tab_close_rect(&tab_rect);
+            if x >= close_rect.left
+                && x < close_rect.right
+                && y >= close_rect.top
+                && y < close_rect.bottom
+            {
+                return TabHitResult::TabClose(i);
+            }
+            return TabHitResult::Tab(i);
+        }
+    }
+
+    // Check new tab button
+    let new_tab_rect = get_new_tab_button_rect(tab_count, client_width);
+    if new_tab_rect.right <= max_x {
+        if x >= new_tab_rect.left && x < new_tab_rect.right {
+            return TabHitResult::NewTabButton;
+        }
+    }
+
+    // In the tab bar area but not on any element - this is caption (draggable)
+    if x < TAB_BAR_LEFT_MARGIN + (tab_count as i32 * TAB_WIDTH) + NEW_TAB_BUTTON_WIDTH {
+        return TabHitResult::Caption;
+    }
+
+    TabHitResult::Caption
+}
+
+/// Calculate the target index for dropping a tab at position x
+fn calculate_drop_index(x: i32, tab_count: usize, client_width: i32) -> usize {
+    let _ = client_width; // Reserved for future dynamic sizing
+
+    // Calculate which slot the mouse is over
+    let relative_x = x - TAB_BAR_LEFT_MARGIN;
+    if relative_x < 0 {
+        return 0;
+    }
+
+    let index = (relative_x / TAB_WIDTH) as usize;
+    if index >= tab_count {
+        tab_count.saturating_sub(1)
+    } else {
+        index
+    }
+}
+
+/// Paint a single tab
+#[allow(unused_must_use)]
+fn paint_tab(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    tab_rect: &RECT,
+    label: &str,
+    is_selected: bool,
+    is_hovered: bool,
+    close_hovered: bool,
+    background_color: u32,
+) {
+    unsafe {
+        // Determine tab background color
+        let tab_bg = if is_selected {
+            background_color // Selected tab matches titlebar
+        } else if is_hovered {
+            TAB_HOVER_COLOR
+        } else {
+            TAB_UNSELECTED_COLOR
+        };
+
+        let tab_brush = CreateSolidBrush(COLORREF(rgb_to_colorref(tab_bg)));
+        FillRect(hdc, tab_rect, tab_brush);
+        DeleteObject(HGDIOBJ(tab_brush.0));
+
+        // Draw outline around tab
+        let outline_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
+        let old_pen = SelectObject(hdc, HGDIOBJ(outline_pen.0));
+
+        // Draw tab outline (top, left, right; bottom only if not selected)
+        MoveToEx(hdc, tab_rect.left, tab_rect.bottom, None);
+        LineTo(hdc, tab_rect.left, tab_rect.top);
+        LineTo(hdc, tab_rect.right - 1, tab_rect.top);
+        LineTo(hdc, tab_rect.right - 1, tab_rect.bottom);
+        if !is_selected {
+            MoveToEx(hdc, tab_rect.left, tab_rect.bottom - 1, None);
+            LineTo(hdc, tab_rect.right, tab_rect.bottom - 1);
+        }
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(outline_pen.0));
+
+        // Draw tab label
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
+
+        let mut lf = LOGFONTW::default();
+        lf.lfHeight = -12;
+        lf.lfWeight = 400;
+        let font_name = "Segoe UI";
+        for (i, c) in font_name.encode_utf16().enumerate() {
+            if i < 32 {
+                lf.lfFaceName[i] = c;
+            }
+        }
+        let font = CreateFontIndirectW(&lf);
+        let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+
+        // Label position (left-aligned with padding, leaving room for close button)
+        let label_x = tab_rect.left + 8;
+        let label_y = (tab_rect.top + tab_rect.bottom - 12) / 2;
+        let label_wide: Vec<u16> = label.encode_utf16().collect();
+        TextOutW(hdc, label_x, label_y, &label_wide);
+
+        SelectObject(hdc, old_font);
+        DeleteObject(HGDIOBJ(font.0));
+
+        // Draw close button
+        let close_rect = get_tab_close_rect(tab_rect);
+
+        // Close button background on hover
+        if close_hovered {
+            let close_hover_brush =
+                CreateSolidBrush(COLORREF(rgb_to_colorref(TAB_CLOSE_HOVER_COLOR)));
+            FillRect(hdc, &close_rect, close_hover_brush);
+            DeleteObject(HGDIOBJ(close_hover_brush.0));
+        }
+
+        // Draw X for close button
+        let close_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
+        let old_pen = SelectObject(hdc, HGDIOBJ(close_pen.0));
+
+        let cx = (close_rect.left + close_rect.right) / 2;
+        let cy = (close_rect.top + close_rect.bottom) / 2;
+        let size = 4;
+
+        MoveToEx(hdc, cx - size, cy - size, None);
+        LineTo(hdc, cx + size + 1, cy + size + 1);
+        MoveToEx(hdc, cx + size, cy - size, None);
+        LineTo(hdc, cx - size - 1, cy + size + 1);
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(close_pen.0));
+    }
+}
+
+/// Paint the new tab (+) button
+#[allow(unused_must_use)]
+fn paint_new_tab_button(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT, is_hovered: bool) {
+    unsafe {
+        // Background on hover
+        if is_hovered {
+            let hover_brush = CreateSolidBrush(COLORREF(rgb_to_colorref(TAB_HOVER_COLOR)));
+            FillRect(hdc, rect, hover_brush);
+            DeleteObject(HGDIOBJ(hover_brush.0));
+        }
+
+        // Draw + icon
+        let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
+        let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+
+        let cx = (rect.left + rect.right) / 2;
+        let cy = (rect.top + rect.bottom) / 2;
+        let size = 6;
+
+        // Horizontal line
+        MoveToEx(hdc, cx - size, cy, None);
+        LineTo(hdc, cx + size + 1, cy);
+        // Vertical line
+        MoveToEx(hdc, cx, cy - size, None);
+        LineTo(hdc, cx, cy + size + 1);
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// Paint the tab bar (all tabs and new tab button)
+#[allow(unused_must_use)]
+fn paint_tab_bar(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    tab_manager: &TabManager,
+    hovered_tab: HoveredTab,
+    client_width: i32,
+    background_color: u32,
+) {
+    let max_x = get_tab_bar_max_x(client_width);
+
+    for (i, _tab) in tab_manager.iter() {
+        let tab_rect = get_tab_rect(i, client_width);
+        if tab_rect.left > max_x {
+            break; // Overflow
+        }
+
+        let is_selected = i == tab_manager.selected_index();
+        let is_hovered = matches!(hovered_tab, HoveredTab::Tab(idx) if idx == i);
+        let close_hovered = matches!(hovered_tab, HoveredTab::TabClose(idx) if idx == i);
+        let label = tab_manager.get_tab_label(i);
+
+        paint_tab(
+            hdc,
+            &tab_rect,
+            &label,
+            is_selected,
+            is_hovered,
+            close_hovered,
+            background_color,
+        );
+    }
+
+    // Paint new tab button
+    let new_tab_rect = get_new_tab_button_rect(tab_manager.count(), client_width);
+    if new_tab_rect.right <= max_x {
+        let is_hovered = matches!(hovered_tab, HoveredTab::NewTabButton);
+        paint_new_tab_button(hdc, &new_tab_rect, is_hovered);
+    }
+}
+
 /// Paint the title bar
 #[allow(unused_must_use)]
 fn paint_titlebar(
@@ -242,6 +573,8 @@ fn paint_titlebar(
     ps: &PAINTSTRUCT,
     background_color: u32,
     hovered_button: HoveredButton,
+    hovered_tab: HoveredTab,
+    tab_manager: &TabManager,
 ) {
     unsafe {
         let hdc = ps.hdc;
@@ -259,6 +592,35 @@ fn paint_titlebar(
         let bg_brush = CreateSolidBrush(bg_colorref);
         FillRect(hdc, &client_rect, bg_brush);
         DeleteObject(HGDIOBJ(bg_brush.0));
+
+        // Draw content area outline
+        let content_rect = RECT {
+            left: CONTENT_INSET - 1,
+            top: TITLEBAR_HEIGHT + CONTENT_INSET - 1,
+            right: client_rect.right - CONTENT_INSET + 1,
+            bottom: client_rect.bottom - CONTENT_INSET + 1,
+        };
+        let outline_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
+        let old_pen = SelectObject(hdc, HGDIOBJ(outline_pen.0));
+
+        // Draw content area outline rectangle
+        MoveToEx(hdc, content_rect.left, content_rect.top, None);
+        LineTo(hdc, content_rect.right, content_rect.top);
+        LineTo(hdc, content_rect.right, content_rect.bottom);
+        LineTo(hdc, content_rect.left, content_rect.bottom);
+        LineTo(hdc, content_rect.left, content_rect.top);
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(outline_pen.0));
+
+        // Paint tab bar
+        paint_tab_bar(
+            hdc,
+            tab_manager,
+            hovered_tab,
+            client_width,
+            background_color,
+        );
 
         // Get button rectangles
         let (minimize_rect, maximize_rect, close_rect) = get_button_rects(client_width);
@@ -282,35 +644,6 @@ fn paint_titlebar(
 
         DeleteObject(HGDIOBJ(hover_brush.0));
         DeleteObject(HGDIOBJ(close_hover_brush.0));
-
-        // Set up text drawing
-        SetBkMode(hdc, TRANSPARENT);
-        SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
-
-        // Draw window title
-        let title = "neovide-tabs";
-        let title_wide: Vec<u16> = title.encode_utf16().collect();
-
-        // Create a font for the title
-        let mut lf = LOGFONTW::default();
-        lf.lfHeight = -14; // 14 pixels
-        lf.lfWeight = 400; // Normal weight
-        let font_name = "Segoe UI";
-        for (i, c) in font_name.encode_utf16().enumerate() {
-            if i < 32 {
-                lf.lfFaceName[i] = c;
-            }
-        }
-        let font = CreateFontIndirectW(&lf);
-        let old_font = SelectObject(hdc, HGDIOBJ(font.0));
-
-        // Draw title (with some padding from left)
-        let title_x = 12;
-        let title_y = (TITLEBAR_HEIGHT - 14) / 2; // Center vertically
-        TextOutW(hdc, title_x, title_y, &title_wide);
-
-        SelectObject(hdc, old_font);
-        DeleteObject(HGDIOBJ(font.0));
 
         // Draw button icons using simple lines (white color)
         let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
@@ -375,40 +708,34 @@ unsafe extern "system" fn window_proc(
             // Get background color from thread-local storage
             let background_color = INITIAL_BG_COLOR.with(|c| c.get());
 
+            // Create tab manager and initial tab
+            let mut tab_manager = TabManager::new();
+
             // Get content area dimensions (below title bar)
             if let Ok(rect) = get_content_rect(hwnd) {
                 let width = (rect.right - rect.left) as u32;
                 let height = (rect.bottom - rect.top) as u32;
 
-                // Spawn Neovide process with parent window handle
-                match NeovideProcess::spawn(width, height, hwnd) {
-                    Ok(process) => {
-                        let state = Box::new(WindowState {
-                            neovide_process: Some(process),
-                            in_size_move: false,
-                            background_color,
-                            hovered_button: HoveredButton::None,
-                            tracking_mouse: false,
-                        });
-                        let state_ptr = Box::into_raw(state);
-                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
-                    }
+                // Create initial tab with Neovide process
+                match tab_manager.create_tab(width, height, hwnd) {
+                    Ok(_) => {}
                     Err(e) => {
                         let error_msg = format!("Failed to launch Neovide: {}", e);
                         show_error(&error_msg, "Error: Failed to Launch Neovide");
-                        // Still create state without neovide process
-                        let state = Box::new(WindowState {
-                            neovide_process: None,
-                            in_size_move: false,
-                            background_color,
-                            hovered_button: HoveredButton::None,
-                            tracking_mouse: false,
-                        });
-                        let state_ptr = Box::into_raw(state);
-                        SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
                     }
                 }
             }
+
+            let state = Box::new(WindowState {
+                tab_manager,
+                in_size_move: false,
+                background_color,
+                hovered_button: HoveredButton::None,
+                hovered_tab: HoveredTab::None,
+                tracking_mouse: false,
+            });
+            let state_ptr = Box::into_raw(state);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
             LRESULT(0)
         }
 
@@ -498,14 +825,37 @@ unsafe extern "system" fn window_proc(
 
                     // Check if in title bar area
                     if pt.y >= 0 && pt.y < TITLEBAR_HEIGHT {
-                        // Check buttons
+                        // Check window control buttons first
                         let button = hit_test_buttons(pt.x, pt.y, client_width);
                         match button {
                             HoveredButton::Minimize => return LRESULT(HTMINBUTTON as isize),
                             HoveredButton::Maximize => return LRESULT(HTMAXBUTTON as isize),
                             HoveredButton::Close => return LRESULT(HTCLOSE as isize),
                             HoveredButton::None => {
-                                // Not on a button, this is the draggable caption area
+                                // Check tab bar area
+                                let state_ptr =
+                                    GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+                                if !state_ptr.is_null() {
+                                    let state = &*state_ptr;
+                                    let tab_hit = hit_test_tab_bar(
+                                        pt.x,
+                                        pt.y,
+                                        state.tab_manager.count(),
+                                        client_width,
+                                    );
+                                    match tab_hit {
+                                        TabHitResult::Tab(_)
+                                        | TabHitResult::TabClose(_)
+                                        | TabHitResult::NewTabButton => {
+                                            // These are handled as client area clicks
+                                            return LRESULT(HTCLIENT as isize);
+                                        }
+                                        TabHitResult::Caption | TabHitResult::None => {
+                                            return LRESULT(HTCAPTION as isize);
+                                        }
+                                    }
+                                }
+                                // Default to caption if no state
                                 return LRESULT(HTCAPTION as isize);
                             }
                         }
@@ -585,29 +935,58 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_MOUSELEAVE => {
-            // Also handle client area mouse leave
+            // Handle client area mouse leave
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 state.tracking_mouse = false;
+
+                // Clear tab hover state
+                if state.hovered_tab != HoveredTab::None {
+                    state.hovered_tab = HoveredTab::None;
+                    let mut client_rect = RECT::default();
+                    if GetClientRect(hwnd, &mut client_rect).is_ok() {
+                        let titlebar_rect = RECT {
+                            left: 0,
+                            top: 0,
+                            right: client_rect.right,
+                            bottom: TITLEBAR_HEIGHT,
+                        };
+                        InvalidateRect(hwnd, Some(&titlebar_rect), false);
+                    }
+                }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         WM_PAINT => {
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            let (background_color, hovered_button) = if !state_ptr.is_null() {
-                let state = &*state_ptr;
-                (state.background_color, state.hovered_button)
-            } else {
-                (0x1a1b26, HoveredButton::None)
-            };
 
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(hwnd, &mut ps);
 
-            // Paint the title bar
-            paint_titlebar(hwnd, &ps, background_color, hovered_button);
+            if !state_ptr.is_null() {
+                let state = &*state_ptr;
+                paint_titlebar(
+                    hwnd,
+                    &ps,
+                    state.background_color,
+                    state.hovered_button,
+                    state.hovered_tab,
+                    &state.tab_manager,
+                );
+            } else {
+                // Fallback with empty tab manager
+                let empty_manager = TabManager::new();
+                paint_titlebar(
+                    hwnd,
+                    &ps,
+                    0x1a1b26,
+                    HoveredButton::None,
+                    HoveredTab::None,
+                    &empty_manager,
+                );
+            }
 
             EndPaint(hwnd, &ps);
             LRESULT(0)
@@ -631,31 +1010,29 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_EXITSIZEMOVE => {
-            // User finished dragging or resizing - now reposition Neovide
+            // User finished dragging or resizing - now reposition all Neovide windows
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 state.in_size_move = false;
-                if let Some(ref process) = state.neovide_process {
-                    process.update_position(hwnd, TITLEBAR_HEIGHT);
-                }
+                state
+                    .tab_manager
+                    .update_all_positions(hwnd, TITLEBAR_HEIGHT);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         WM_ACTIVATE => {
-            // Bring Neovide to foreground when wrapper is activated
+            // Bring selected tab's Neovide to foreground when wrapper is activated
             // Use a short delay to allow WM_ENTERSIZEMOVE to fire first if this is a drag
             let activated = (wparam.0 & 0xFFFF) != 0; // WA_INACTIVE = 0
             if activated {
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
                 if !state_ptr.is_null() {
                     let state = &*state_ptr;
-                    if let Some(ref process) = state.neovide_process {
-                        if process.is_ready() {
-                            // Schedule delayed foreground activation
-                            SetTimer(hwnd, FOREGROUND_TIMER_ID, FOREGROUND_DELAY_MS, None);
-                        }
+                    if state.tab_manager.is_selected_ready() {
+                        // Schedule delayed foreground activation
+                        SetTimer(hwnd, FOREGROUND_TIMER_ID, FOREGROUND_DELAY_MS, None);
                     }
                 }
             } else {
@@ -674,9 +1051,7 @@ unsafe extern "system" fn window_proc(
                 if !state_ptr.is_null() {
                     let state = &*state_ptr;
                     if !state.in_size_move {
-                        if let Some(ref process) = state.neovide_process {
-                            process.bring_to_foreground();
-                        }
+                        state.tab_manager.bring_selected_to_foreground();
                     }
                 }
             } else if wparam.0 == POSITION_UPDATE_TIMER_ID {
@@ -687,9 +1062,9 @@ unsafe extern "system" fn window_proc(
                 if !state_ptr.is_null() {
                     let state = &*state_ptr;
                     if !state.in_size_move {
-                        if let Some(ref process) = state.neovide_process {
-                            process.update_position(hwnd, TITLEBAR_HEIGHT);
-                        }
+                        state
+                            .tab_manager
+                            .update_all_positions(hwnd, TITLEBAR_HEIGHT);
                     }
                 }
             }
@@ -703,7 +1078,7 @@ unsafe extern "system" fn window_proc(
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
                 let state = &*state_ptr;
-                if !state.in_size_move && state.neovide_process.is_some() {
+                if !state.in_size_move && !state.tab_manager.is_empty() {
                     // Schedule a deferred position update - this will be cancelled
                     // if more WM_WINDOWPOSCHANGED messages arrive, effectively debouncing
                     SetTimer(
@@ -735,13 +1110,11 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_CLOSE => {
-            // Terminate Neovide process
+            // Terminate all Neovide processes
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
                 let mut state = Box::from_raw(state_ptr);
-                if let Some(mut process) = state.neovide_process.take() {
-                    let _ = process.terminate();
-                }
+                state.tab_manager.terminate_all();
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             }
             DestroyWindow(hwnd).ok();
@@ -750,6 +1123,164 @@ unsafe extern "system" fn window_proc(
 
         WM_DESTROY => {
             PostQuitMessage(0);
+            LRESULT(0)
+        }
+
+        WM_LBUTTONDOWN => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                let mut client_rect = RECT::default();
+                if GetClientRect(hwnd, &mut client_rect).is_ok() {
+                    let client_width = client_rect.right;
+                    let tab_hit = hit_test_tab_bar(x, y, state.tab_manager.count(), client_width);
+
+                    match tab_hit {
+                        TabHitResult::Tab(index) => {
+                            // Start potential drag
+                            state.tab_manager.drag_state = Some(DragState {
+                                tab_index: index,
+                                start_x: x,
+                                current_x: x,
+                            });
+                            // Capture mouse for drag tracking
+                            SetCapture(hwnd);
+                        }
+                        TabHitResult::TabClose(index) => {
+                            // Close the tab
+                            let should_close_window = state.tab_manager.close_tab(index);
+                            if should_close_window {
+                                // Last tab closed - close the window
+                                PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+                            } else {
+                                // Show the newly selected tab
+                                state.tab_manager.show_selected_hide_others();
+                                InvalidateRect(hwnd, None, true);
+                            }
+                        }
+                        TabHitResult::NewTabButton => {
+                            // Create new tab
+                            if let Ok(rect) = get_content_rect(hwnd) {
+                                let width = (rect.right - rect.left) as u32;
+                                let height = (rect.bottom - rect.top) as u32;
+
+                                match state.tab_manager.create_tab(width, height, hwnd) {
+                                    Ok(_) => {
+                                        // Show the new tab, hide others
+                                        state.tab_manager.show_selected_hide_others();
+                                        InvalidateRect(hwnd, None, true);
+                                    }
+                                    Err(e) => {
+                                        let error_msg = format!("Failed to create new tab: {}", e);
+                                        show_error(&error_msg, "Error: Failed to Create Tab");
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_LBUTTONUP => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let _y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+
+                if let Some(drag) = state.tab_manager.drag_state.take() {
+                    ReleaseCapture().ok();
+
+                    if drag.is_active() {
+                        // Complete the drag - calculate target position
+                        let mut client_rect = RECT::default();
+                        if GetClientRect(hwnd, &mut client_rect).is_ok() {
+                            let client_width = client_rect.right;
+                            let target_index =
+                                calculate_drop_index(x, state.tab_manager.count(), client_width);
+                            if target_index != drag.tab_index {
+                                state.tab_manager.move_tab(drag.tab_index, target_index);
+                            }
+                        }
+                        InvalidateRect(hwnd, None, true);
+                    } else {
+                        // This was a click, not a drag - select the tab
+                        if state.tab_manager.select_tab(drag.tab_index) {
+                            state.tab_manager.show_selected_hide_others();
+                            InvalidateRect(hwnd, None, true);
+                        } else {
+                            // Already selected, just bring to foreground
+                            state.tab_manager.bring_selected_to_foreground();
+                        }
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+
+                // Update drag state if dragging
+                if let Some(ref mut drag) = state.tab_manager.drag_state {
+                    drag.current_x = x;
+                    if drag.is_active() {
+                        // Repaint for drag feedback
+                        InvalidateRect(hwnd, None, true);
+                    }
+                } else {
+                    // Not dragging - update hover state
+                    let mut client_rect = RECT::default();
+                    if GetClientRect(hwnd, &mut client_rect).is_ok() {
+                        let client_width = client_rect.right;
+                        let tab_hit =
+                            hit_test_tab_bar(x, y, state.tab_manager.count(), client_width);
+
+                        let new_hover = match tab_hit {
+                            TabHitResult::Tab(i) => HoveredTab::Tab(i),
+                            TabHitResult::TabClose(i) => HoveredTab::TabClose(i),
+                            TabHitResult::NewTabButton => HoveredTab::NewTabButton,
+                            _ => HoveredTab::None,
+                        };
+
+                        if new_hover != state.hovered_tab {
+                            state.hovered_tab = new_hover;
+                            // Invalidate titlebar for hover effect
+                            let titlebar_rect = RECT {
+                                left: 0,
+                                top: 0,
+                                right: client_rect.right,
+                                bottom: TITLEBAR_HEIGHT,
+                            };
+                            InvalidateRect(hwnd, Some(&titlebar_rect), false);
+                        }
+                    }
+
+                    // Track mouse to get WM_MOUSELEAVE
+                    if !state.tracking_mouse {
+                        let mut tme = TRACKMOUSEEVENT {
+                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        };
+                        TrackMouseEvent(&mut tme);
+                        state.tracking_mouse = true;
+                    }
+                }
+            }
             LRESULT(0)
         }
 
@@ -858,5 +1389,96 @@ mod tests {
             hit_test_buttons(100, TITLEBAR_HEIGHT + 10, width),
             HoveredButton::None
         );
+    }
+
+    #[test]
+    fn test_get_tab_rect() {
+        let tab0 = get_tab_rect(0, 1024);
+        assert_eq!(tab0.left, TAB_BAR_LEFT_MARGIN);
+        assert_eq!(tab0.right, TAB_BAR_LEFT_MARGIN + TAB_WIDTH);
+        assert_eq!(tab0.top, TAB_VERTICAL_PADDING);
+        assert_eq!(tab0.bottom, TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING);
+
+        let tab1 = get_tab_rect(1, 1024);
+        assert_eq!(tab1.left, TAB_BAR_LEFT_MARGIN + TAB_WIDTH);
+        assert_eq!(tab1.right, TAB_BAR_LEFT_MARGIN + TAB_WIDTH * 2);
+    }
+
+    #[test]
+    fn test_get_new_tab_button_rect() {
+        let btn = get_new_tab_button_rect(0, 1024);
+        assert_eq!(btn.left, TAB_BAR_LEFT_MARGIN);
+        assert_eq!(btn.right, TAB_BAR_LEFT_MARGIN + NEW_TAB_BUTTON_WIDTH);
+
+        let btn = get_new_tab_button_rect(2, 1024);
+        assert_eq!(btn.left, TAB_BAR_LEFT_MARGIN + TAB_WIDTH * 2);
+    }
+
+    #[test]
+    fn test_hit_test_tab_bar() {
+        let width = 1024;
+        let tab_count = 2;
+        let y = (TAB_VERTICAL_PADDING + TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING) / 2;
+
+        // First tab area
+        let x = TAB_BAR_LEFT_MARGIN + 20;
+        assert_eq!(
+            hit_test_tab_bar(x, y, tab_count, width),
+            TabHitResult::Tab(0)
+        );
+
+        // Second tab area
+        let x = TAB_BAR_LEFT_MARGIN + TAB_WIDTH + 20;
+        assert_eq!(
+            hit_test_tab_bar(x, y, tab_count, width),
+            TabHitResult::Tab(1)
+        );
+
+        // New tab button area
+        let x = TAB_BAR_LEFT_MARGIN + TAB_WIDTH * 2 + 10;
+        assert_eq!(
+            hit_test_tab_bar(x, y, tab_count, width),
+            TabHitResult::NewTabButton
+        );
+
+        // Caption area (between new tab button and window buttons)
+        let x = TAB_BAR_LEFT_MARGIN + TAB_WIDTH * 2 + NEW_TAB_BUTTON_WIDTH + 50;
+        assert_eq!(
+            hit_test_tab_bar(x, y, tab_count, width),
+            TabHitResult::Caption
+        );
+    }
+
+    #[test]
+    fn test_calculate_drop_index() {
+        let width = 1024;
+        let tab_count = 3;
+
+        // Position at first tab
+        assert_eq!(
+            calculate_drop_index(TAB_BAR_LEFT_MARGIN + 10, tab_count, width),
+            0
+        );
+
+        // Position at second tab
+        assert_eq!(
+            calculate_drop_index(TAB_BAR_LEFT_MARGIN + TAB_WIDTH + 10, tab_count, width),
+            1
+        );
+
+        // Position at third tab
+        assert_eq!(
+            calculate_drop_index(TAB_BAR_LEFT_MARGIN + TAB_WIDTH * 2 + 10, tab_count, width),
+            2
+        );
+
+        // Position beyond last tab
+        assert_eq!(
+            calculate_drop_index(TAB_BAR_LEFT_MARGIN + TAB_WIDTH * 10, tab_count, width),
+            2
+        );
+
+        // Position before first tab
+        assert_eq!(calculate_drop_index(0, tab_count, width), 0);
     }
 }
