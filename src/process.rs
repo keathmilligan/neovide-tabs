@@ -90,8 +90,8 @@ impl NeovideProcess {
                     );
                     eprintln!("  Visible: {}", info.visible);
 
-                    // Position the window
-                    match move_window_to_parent_client_area(info.hwnd, parent_hwnd) {
+                    // Position the window (32 is the title bar height)
+                    match move_window_to_parent_content_area(info.hwnd, parent_hwnd, 32) {
                         Ok(_) => {
                             eprintln!("Successfully positioned Neovide window");
                         }
@@ -151,11 +151,14 @@ impl NeovideProcess {
         }
     }
 
-    /// Update the Neovide window position and size to match parent's client area
-    pub fn update_position(&self, parent_hwnd: HWND) {
+    /// Update the Neovide window position and size to match parent's content area
+    /// (client area minus title bar)
+    pub fn update_position(&self, parent_hwnd: HWND, titlebar_height: i32) {
         if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
             let neovide_hwnd = HWND(hwnd_raw as *mut _);
-            if let Err(e) = move_window_to_parent_client_area(neovide_hwnd, parent_hwnd) {
+            if let Err(e) =
+                move_window_to_parent_content_area(neovide_hwnd, parent_hwnd, titlebar_height)
+            {
                 eprintln!("Failed to update Neovide position: {}", e);
             }
         }
@@ -394,18 +397,22 @@ pub fn debug_list_windows(search: &str) {
     }
 }
 
-/// Move and resize a window to fill the parent's client area
-fn move_window_to_parent_client_area(neovide_hwnd: HWND, parent_hwnd: HWND) -> Result<()> {
+/// Move and resize a window to fill the parent's content area (below title bar)
+fn move_window_to_parent_content_area(
+    neovide_hwnd: HWND,
+    parent_hwnd: HWND,
+    titlebar_height: i32,
+) -> Result<()> {
     unsafe {
         // Get parent window's client area
         let mut client_rect = RECT::default();
         windows::Win32::UI::WindowsAndMessaging::GetClientRect(parent_hwnd, &mut client_rect)
             .context("Failed to get parent client rect")?;
 
-        // Convert top-left of client area to screen coordinates
+        // Convert top-left of content area (below title bar) to screen coordinates
         let mut top_left = windows::Win32::Foundation::POINT {
             x: client_rect.left,
-            y: client_rect.top,
+            y: client_rect.top + titlebar_height,
         };
 
         let result = windows::Win32::Graphics::Gdi::ClientToScreen(parent_hwnd, &mut top_left);
@@ -413,9 +420,9 @@ fn move_window_to_parent_client_area(neovide_hwnd: HWND, parent_hwnd: HWND) -> R
             anyhow::bail!("Failed to convert client to screen coordinates");
         }
 
-        // Target size is the parent's client area size
+        // Target size is the parent's client area size minus title bar height
         let target_width = client_rect.right - client_rect.left;
-        let target_height = client_rect.bottom - client_rect.top;
+        let target_height = client_rect.bottom - client_rect.top - titlebar_height;
 
         // Get Neovide's current rect for debug output
         let mut neovide_rect = RECT::default();
