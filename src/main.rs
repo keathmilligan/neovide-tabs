@@ -45,8 +45,8 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    // Register window class with configured background color
-    window::register_window_class(config.background_color)?;
+    // Register window class with configuration
+    window::register_window_class(config)?;
 
     // Create main window
     let _hwnd = window::create_window()?;

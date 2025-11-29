@@ -1,6 +1,7 @@
 #![cfg(target_os = "windows")]
 
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -38,13 +39,31 @@ impl NeovideProcess {
         Ok(())
     }
 
-    /// Spawn a new Neovide process with the specified dimensions and position it
-    pub fn spawn(width: u32, height: u32, parent_hwnd: HWND) -> Result<Self> {
+    /// Spawn a new Neovide process with the specified dimensions, working directory, and position it
+    pub fn spawn(
+        width: u32,
+        height: u32,
+        parent_hwnd: HWND,
+        working_directory: Option<&Path>,
+    ) -> Result<Self> {
         let mut cmd = Command::new("neovide");
         cmd.arg("--frame")
             .arg("none")
             .arg("--size")
             .arg(format!("{}x{}", width, height));
+
+        // Set working directory if specified
+        if let Some(dir) = working_directory {
+            if dir.is_dir() {
+                cmd.current_dir(dir);
+                eprintln!("Spawning Neovide in directory: {:?}", dir);
+            } else {
+                eprintln!(
+                    "Warning: Working directory {:?} does not exist, using default",
+                    dir
+                );
+            }
+        }
 
         let child = cmd.spawn().context("Failed to spawn Neovide process")?;
 

@@ -3,14 +3,20 @@
 use anyhow::Result;
 use windows::Win32::Foundation::HWND;
 
+use crate::config::Profile;
 use crate::process::NeovideProcess;
 
 /// Represents a single tab with its associated Neovide process
 pub struct Tab {
     /// Unique identifier for this tab
+    #[allow(dead_code)]
     pub id: usize,
     /// The Neovide process associated with this tab
     pub process: NeovideProcess,
+    /// Profile name used to create this tab
+    pub profile_name: String,
+    /// Profile index in the config (for reference)
+    pub profile_index: usize,
 }
 
 /// State for tab drag-and-drop reordering
@@ -99,14 +105,54 @@ impl TabManager {
         self.tabs.get_mut(self.selected_index)
     }
 
-    /// Create a new tab with a spawned Neovide process
+    /// Create a new tab with a spawned Neovide process using a profile
     /// Returns the index of the new tab, or an error if spawning failed
-    pub fn create_tab(&mut self, width: u32, height: u32, parent_hwnd: HWND) -> Result<usize> {
-        let process = NeovideProcess::spawn(width, height, parent_hwnd)?;
+    pub fn create_tab(
+        &mut self,
+        width: u32,
+        height: u32,
+        parent_hwnd: HWND,
+        profile: &Profile,
+        profile_index: usize,
+    ) -> Result<usize> {
+        let process = NeovideProcess::spawn(
+            width,
+            height,
+            parent_hwnd,
+            Some(profile.working_directory.as_path()),
+        )?;
 
         let tab = Tab {
             id: self.next_id,
             process,
+            profile_name: profile.name.clone(),
+            profile_index,
+        };
+        self.next_id += 1;
+
+        self.tabs.push(tab);
+        let new_index = self.tabs.len() - 1;
+        self.selected_index = new_index;
+
+        Ok(new_index)
+    }
+
+    /// Create a new tab with a spawned Neovide process (legacy, uses no working directory)
+    /// Returns the index of the new tab, or an error if spawning failed
+    #[allow(dead_code)]
+    pub fn create_tab_simple(
+        &mut self,
+        width: u32,
+        height: u32,
+        parent_hwnd: HWND,
+    ) -> Result<usize> {
+        let process = NeovideProcess::spawn(width, height, parent_hwnd, None)?;
+
+        let tab = Tab {
+            id: self.next_id,
+            process,
+            profile_name: "Default".to_string(),
+            profile_index: 0,
         };
         self.next_id += 1;
 
@@ -277,13 +323,19 @@ impl TabManager {
         }
     }
 
-    /// Get the label for a tab (e.g., "Tab 1", "Tab 2")
+    /// Get the label for a tab (profile name)
     pub fn get_tab_label(&self, index: usize) -> String {
         if let Some(tab) = self.tabs.get(index) {
-            format!("Tab {}", tab.id)
+            tab.profile_name.clone()
         } else {
             String::new()
         }
+    }
+
+    /// Get the profile index for a tab
+    #[allow(dead_code)]
+    pub fn get_tab_profile_index(&self, index: usize) -> Option<usize> {
+        self.tabs.get(index).map(|tab| tab.profile_index)
     }
 
     /// Iterate over all tabs with their indices

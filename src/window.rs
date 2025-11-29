@@ -10,10 +10,10 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, HBRUSH, HGDIOBJ, InvalidateRect,
-    LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY, ScreenToClient, SelectObject,
-    SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
+    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
+    CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect,
+    HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY,
+    ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -23,9 +23,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+use crate::config::{Config, Profile};
 use crate::tabs::{DragState, TabManager};
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("NeovideTabsWindow");
+const DROPDOWN_CLASS_NAME: PCWSTR = w!("NeovideTabsDropdown");
 const WINDOW_TITLE: PCWSTR = w!("neovide-tabs");
 
 /// Title bar height in pixels
@@ -59,10 +61,16 @@ const TAB_CLOSE_SIZE: i32 = 16;
 const TAB_CLOSE_PADDING: i32 = 8;
 /// Width of the new tab (+) button
 const NEW_TAB_BUTTON_WIDTH: i32 = 32;
+/// Width of the profile dropdown button (caret)
+const DROPDOWN_BUTTON_WIDTH: i32 = 20;
 /// Left margin before the first tab
 const TAB_BAR_LEFT_MARGIN: i32 = 8;
 /// Vertical padding for tabs within the titlebar
 const TAB_VERTICAL_PADDING: i32 = 4;
+/// Height of each item in the dropdown menu
+const DROPDOWN_ITEM_HEIGHT: i32 = 28;
+/// Padding around dropdown menu
+const DROPDOWN_PADDING: i32 = 4;
 
 // Tab bar colors
 /// Background color for unselected tabs (slightly darker than titlebar)
@@ -92,6 +100,10 @@ pub enum TabHitResult {
     TabClose(usize),
     /// Hit the new tab (+) button
     NewTabButton,
+    /// Hit the profile dropdown button (caret)
+    ProfileDropdown,
+    /// Hit a profile in the dropdown menu (index)
+    DropdownItem(usize),
     /// Hit the caption/drag area
     Caption,
     /// Hit nothing in the tab bar
@@ -109,21 +121,47 @@ enum HoveredTab {
     TabClose(usize),
     /// Hovering over new tab button
     NewTabButton,
+    /// Hovering over profile dropdown button
+    ProfileDropdown,
+    /// Hovering over dropdown menu item (index) - unused, popup handles hover
+    #[allow(dead_code)]
+    DropdownItem(usize),
+}
+
+/// State of the profile dropdown menu
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropdownState {
+    /// Dropdown is closed
+    Closed,
+    /// Dropdown is open
+    Open,
 }
 
 /// Application state stored in window user data
 struct WindowState {
     tab_manager: TabManager,
+    config: Config,
     in_size_move: bool,
     background_color: u32,
     hovered_button: HoveredButton,
     hovered_tab: HoveredTab,
     tracking_mouse: bool,
+    dropdown_state: DropdownState,
+    dropdown_hwnd: Option<HWND>,
 }
 
-// Thread-local storage for background color during window creation
+/// State for the dropdown popup window
+struct DropdownPopupState {
+    parent_hwnd: HWND,
+    profiles: Vec<Profile>,
+    hovered_item: Option<usize>,
+    background_color: u32,
+}
+
+// Thread-local storage for config during window creation
 thread_local! {
     static INITIAL_BG_COLOR: Cell<u32> = const { Cell::new(0x1a1b26) };
+    static INITIAL_CONFIG: std::cell::RefCell<Option<Config>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Convert RGB color (0x00RRGGBB) to Win32 COLORREF (0x00BBGGRR)
@@ -135,9 +173,11 @@ fn rgb_to_colorref(rgb: u32) -> u32 {
 }
 
 /// Register the window class with Win32
-pub fn register_window_class(background_color: u32) -> Result<()> {
-    // Store background color for use in WM_CREATE
+pub fn register_window_class(config: Config) -> Result<()> {
+    // Store config for use in WM_CREATE
+    let background_color = config.background_color;
     INITIAL_BG_COLOR.with(|c| c.set(background_color));
+    INITIAL_CONFIG.with(|c| *c.borrow_mut() = Some(config));
 
     unsafe {
         let hinstance = GetModuleHandleW(None).context("Failed to get module handle")?;
@@ -146,6 +186,7 @@ pub fn register_window_class(background_color: u32) -> Result<()> {
         let colorref = rgb_to_colorref(background_color);
         let brush = CreateSolidBrush(COLORREF(colorref));
 
+        // Register main window class
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
             lpfnWndProc: Some(window_proc),
@@ -162,6 +203,26 @@ pub fn register_window_class(background_color: u32) -> Result<()> {
         let atom = RegisterClassW(&wc);
         if atom == 0 {
             anyhow::bail!("Failed to register window class");
+        }
+
+        // Register dropdown popup window class
+        let dropdown_brush = CreateSolidBrush(COLORREF(colorref));
+        let dropdown_wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            lpfnWndProc: Some(dropdown_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance.into(),
+            hIcon: Default::default(),
+            hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
+            hbrBackground: HBRUSH(dropdown_brush.0),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: DROPDOWN_CLASS_NAME,
+        };
+
+        let dropdown_atom = RegisterClassW(&dropdown_wc);
+        if dropdown_atom == 0 {
+            anyhow::bail!("Failed to register dropdown window class");
         }
     }
 
@@ -332,6 +393,51 @@ fn get_new_tab_button_rect(tab_count: usize, client_width: i32) -> RECT {
     }
 }
 
+/// Get the rectangle for the profile dropdown button (caret)
+fn get_dropdown_button_rect(tab_count: usize, client_width: i32) -> RECT {
+    let new_tab_rect = get_new_tab_button_rect(tab_count, client_width);
+    RECT {
+        left: new_tab_rect.right,
+        top: TAB_VERTICAL_PADDING,
+        right: new_tab_rect.right + DROPDOWN_BUTTON_WIDTH,
+        bottom: TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING,
+    }
+}
+
+/// Get the rectangle for the dropdown menu (unused - popup handles its own layout)
+#[allow(dead_code)]
+fn get_dropdown_menu_rect(tab_count: usize, profile_count: usize, client_width: i32) -> RECT {
+    let dropdown_btn = get_dropdown_button_rect(tab_count, client_width);
+    let menu_width = 180; // Fixed width for dropdown menu
+    let menu_height = (profile_count as i32 * DROPDOWN_ITEM_HEIGHT) + (DROPDOWN_PADDING * 2);
+
+    // Position below the dropdown button, aligned to its left edge
+    RECT {
+        left: dropdown_btn.left,
+        top: TITLEBAR_HEIGHT,
+        right: dropdown_btn.left + menu_width,
+        bottom: TITLEBAR_HEIGHT + menu_height,
+    }
+}
+
+/// Get the rectangle for a dropdown menu item (unused - popup handles its own layout)
+#[allow(dead_code)]
+fn get_dropdown_item_rect(
+    item_index: usize,
+    tab_count: usize,
+    profile_count: usize,
+    client_width: i32,
+) -> RECT {
+    let menu_rect = get_dropdown_menu_rect(tab_count, profile_count, client_width);
+    let top = menu_rect.top + DROPDOWN_PADDING + (item_index as i32 * DROPDOWN_ITEM_HEIGHT);
+    RECT {
+        left: menu_rect.left + DROPDOWN_PADDING,
+        top,
+        right: menu_rect.right - DROPDOWN_PADDING,
+        bottom: top + DROPDOWN_ITEM_HEIGHT,
+    }
+}
+
 /// Get the maximum X position for the tab bar (before window buttons)
 fn get_tab_bar_max_x(client_width: i32) -> i32 {
     client_width - (BUTTON_WIDTH * 3) - 8 // Leave some padding before window buttons
@@ -378,12 +484,49 @@ fn hit_test_tab_bar(x: i32, y: i32, tab_count: usize, client_width: i32) -> TabH
         }
     }
 
+    // Check dropdown button
+    let dropdown_rect = get_dropdown_button_rect(tab_count, client_width);
+    if dropdown_rect.right <= max_x {
+        if x >= dropdown_rect.left && x < dropdown_rect.right {
+            return TabHitResult::ProfileDropdown;
+        }
+    }
+
     // In the tab bar area but not on any element - this is caption (draggable)
-    if x < TAB_BAR_LEFT_MARGIN + (tab_count as i32 * TAB_WIDTH) + NEW_TAB_BUTTON_WIDTH {
+    if x < TAB_BAR_LEFT_MARGIN
+        + (tab_count as i32 * TAB_WIDTH)
+        + NEW_TAB_BUTTON_WIDTH
+        + DROPDOWN_BUTTON_WIDTH
+    {
         return TabHitResult::Caption;
     }
 
     TabHitResult::Caption
+}
+
+/// Hit test in the dropdown menu area (unused - popup handles its own hit testing)
+#[allow(dead_code)]
+fn hit_test_dropdown_menu(
+    x: i32,
+    y: i32,
+    tab_count: usize,
+    profile_count: usize,
+    client_width: i32,
+) -> TabHitResult {
+    let menu_rect = get_dropdown_menu_rect(tab_count, profile_count, client_width);
+
+    // Check if in the menu bounds
+    if x >= menu_rect.left && x < menu_rect.right && y >= menu_rect.top && y < menu_rect.bottom {
+        // Check which item
+        for i in 0..profile_count {
+            let item_rect = get_dropdown_item_rect(i, tab_count, profile_count, client_width);
+            if y >= item_rect.top && y < item_rect.bottom {
+                return TabHitResult::DropdownItem(i);
+            }
+        }
+    }
+
+    TabHitResult::None
 }
 
 /// Calculate the target index for dropping a tab at position x
@@ -573,6 +716,393 @@ fn paint_new_tab_button(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT, is
     }
 }
 
+/// Paint the profile dropdown button (downward caret)
+#[allow(unused_must_use)]
+fn paint_dropdown_button(hdc: windows::Win32::Graphics::Gdi::HDC, rect: &RECT, is_hovered: bool) {
+    unsafe {
+        // Background on hover
+        if is_hovered {
+            let hover_brush = CreateSolidBrush(COLORREF(rgb_to_colorref(TAB_HOVER_COLOR)));
+            FillRect(hdc, rect, hover_brush);
+            DeleteObject(HGDIOBJ(hover_brush.0));
+        }
+
+        // Draw downward caret icon
+        let pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
+        let old_pen = SelectObject(hdc, HGDIOBJ(pen.0));
+
+        let cx = (rect.left + rect.right) / 2;
+        let cy = (rect.top + rect.bottom) / 2;
+        let size = 4;
+
+        // Draw V shape (downward caret)
+        MoveToEx(hdc, cx - size, cy - 2, None);
+        LineTo(hdc, cx, cy + 2);
+        LineTo(hdc, cx + size + 1, cy - 3);
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(pen.0));
+    }
+}
+
+/// Paint the dropdown menu (unused - popup renders itself)
+#[allow(unused_must_use, dead_code)]
+fn paint_dropdown_menu(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    profiles: &[Profile],
+    tab_count: usize,
+    hovered_item: Option<usize>,
+    client_width: i32,
+    background_color: u32,
+) {
+    unsafe {
+        let profile_count = profiles.len();
+        let menu_rect = get_dropdown_menu_rect(tab_count, profile_count, client_width);
+
+        // Draw menu background
+        let bg_brush = CreateSolidBrush(COLORREF(rgb_to_colorref(background_color)));
+        FillRect(hdc, &menu_rect, bg_brush);
+        DeleteObject(HGDIOBJ(bg_brush.0));
+
+        // Draw menu border
+        let border_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
+        let old_pen = SelectObject(hdc, HGDIOBJ(border_pen.0));
+
+        MoveToEx(hdc, menu_rect.left, menu_rect.top, None);
+        LineTo(hdc, menu_rect.right - 1, menu_rect.top);
+        LineTo(hdc, menu_rect.right - 1, menu_rect.bottom - 1);
+        LineTo(hdc, menu_rect.left, menu_rect.bottom - 1);
+        LineTo(hdc, menu_rect.left, menu_rect.top);
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(border_pen.0));
+
+        // Draw each menu item
+        for (i, profile) in profiles.iter().enumerate() {
+            let item_rect = get_dropdown_item_rect(i, tab_count, profile_count, client_width);
+            let is_hovered = hovered_item == Some(i);
+
+            // Item background on hover
+            if is_hovered {
+                let hover_brush = CreateSolidBrush(COLORREF(rgb_to_colorref(TAB_HOVER_COLOR)));
+                FillRect(hdc, &item_rect, hover_brush);
+                DeleteObject(HGDIOBJ(hover_brush.0));
+            }
+
+            // Draw profile name
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
+
+            let mut lf = LOGFONTW::default();
+            lf.lfHeight = -12;
+            lf.lfWeight = 400;
+            let font_name = "Segoe UI";
+            for (j, c) in font_name.encode_utf16().enumerate() {
+                if j < 32 {
+                    lf.lfFaceName[j] = c;
+                }
+            }
+            let font = CreateFontIndirectW(&lf);
+            let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+
+            // Text position (with left padding for icon space)
+            let text_x = item_rect.left + 24; // Leave space for icon
+            let text_y = (item_rect.top + item_rect.bottom - 12) / 2;
+            let name_wide: Vec<u16> = profile.name.encode_utf16().collect();
+            TextOutW(hdc, text_x, text_y, &name_wide);
+
+            SelectObject(hdc, old_font);
+            DeleteObject(HGDIOBJ(font.0));
+        }
+    }
+}
+
+/// Create the dropdown popup window
+fn create_dropdown_popup(
+    parent_hwnd: HWND,
+    profiles: Vec<Profile>,
+    background_color: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<HWND> {
+    unsafe {
+        let hinstance = GetModuleHandleW(None).ok()?;
+
+        // Create popup state
+        let popup_state = Box::new(DropdownPopupState {
+            parent_hwnd,
+            profiles,
+            hovered_item: None,
+            background_color,
+        });
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            DROPDOWN_CLASS_NAME,
+            w!(""),
+            WS_POPUP | WS_VISIBLE,
+            x,
+            y,
+            width,
+            height,
+            None, // No parent - independent window
+            None,
+            hinstance,
+            Some(Box::into_raw(popup_state) as *const std::ffi::c_void),
+        )
+        .ok()?;
+
+        Some(hwnd)
+    }
+}
+
+/// Show the dropdown popup at the appropriate position
+#[allow(unused_must_use)]
+fn show_dropdown_popup(parent_hwnd: HWND, state: &mut WindowState) {
+    // Close any existing popup first
+    if let Some(popup_hwnd) = state.dropdown_hwnd.take() {
+        unsafe {
+            DestroyWindow(popup_hwnd).ok();
+        }
+    }
+
+    unsafe {
+        let mut client_rect = RECT::default();
+        if GetClientRect(parent_hwnd, &mut client_rect).is_err() {
+            return;
+        }
+
+        let dropdown_btn = get_dropdown_button_rect(state.tab_manager.count(), client_rect.right);
+
+        // Convert button position to screen coordinates
+        let mut screen_pt = POINT {
+            x: dropdown_btn.left,
+            y: dropdown_btn.bottom,
+        };
+        ClientToScreen(parent_hwnd, &mut screen_pt);
+
+        let profile_count = state.config.profiles.len();
+        let menu_width = 150;
+        let menu_height = (profile_count as i32 * DROPDOWN_ITEM_HEIGHT) + (DROPDOWN_PADDING * 2);
+
+        // IMPORTANT: Clicking on our title bar brought our window to the foreground,
+        // which covers the Neovide window. We need to bring Neovide back to the
+        // foreground BEFORE showing the popup (which is topmost and will appear above it).
+        state.tab_manager.bring_selected_to_foreground();
+
+        if let Some(popup_hwnd) = create_dropdown_popup(
+            parent_hwnd,
+            state.config.profiles.clone(),
+            state.background_color,
+            screen_pt.x,
+            screen_pt.y,
+            menu_width,
+            menu_height,
+        ) {
+            state.dropdown_hwnd = Some(popup_hwnd);
+            state.dropdown_state = DropdownState::Open;
+        }
+    }
+}
+
+/// Hide and destroy the dropdown popup
+fn hide_dropdown_popup(_parent_hwnd: HWND, state: &mut WindowState) {
+    if let Some(popup_hwnd) = state.dropdown_hwnd.take() {
+        unsafe {
+            ReleaseCapture().ok();
+            DestroyWindow(popup_hwnd).ok();
+        }
+    }
+    state.dropdown_state = DropdownState::Closed;
+}
+
+/// Window procedure for the dropdown popup
+#[allow(unused_must_use)]
+unsafe extern "system" fn dropdown_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_CREATE => {
+                let create_struct = lparam.0 as *const CREATESTRUCTW;
+                if !create_struct.is_null() {
+                    let state_ptr = (*create_struct).lpCreateParams as *mut DropdownPopupState;
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+                }
+                // Capture mouse to detect clicks outside the popup
+                SetCapture(hwnd);
+                LRESULT(0)
+            }
+
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DropdownPopupState;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+
+                    let mut rect = RECT::default();
+                    GetClientRect(hwnd, &mut rect).ok();
+
+                    // Fill background
+                    let bg_brush =
+                        CreateSolidBrush(COLORREF(rgb_to_colorref(state.background_color)));
+                    FillRect(hdc, &rect, bg_brush);
+                    DeleteObject(HGDIOBJ(bg_brush.0));
+
+                    // Draw border
+                    let border_pen =
+                        CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
+                    let old_pen = SelectObject(hdc, HGDIOBJ(border_pen.0));
+                    MoveToEx(hdc, rect.left, rect.top, None);
+                    LineTo(hdc, rect.right - 1, rect.top);
+                    LineTo(hdc, rect.right - 1, rect.bottom - 1);
+                    LineTo(hdc, rect.left, rect.bottom - 1);
+                    LineTo(hdc, rect.left, rect.top);
+                    SelectObject(hdc, old_pen);
+                    DeleteObject(HGDIOBJ(border_pen.0));
+
+                    // Draw each profile item
+                    for (i, profile) in state.profiles.iter().enumerate() {
+                        let item_top = DROPDOWN_PADDING + (i as i32 * DROPDOWN_ITEM_HEIGHT);
+                        let item_rect = RECT {
+                            left: DROPDOWN_PADDING,
+                            top: item_top,
+                            right: rect.right - DROPDOWN_PADDING,
+                            bottom: item_top + DROPDOWN_ITEM_HEIGHT,
+                        };
+
+                        // Hover background
+                        if state.hovered_item == Some(i) {
+                            let hover_brush =
+                                CreateSolidBrush(COLORREF(rgb_to_colorref(TAB_HOVER_COLOR)));
+                            FillRect(hdc, &item_rect, hover_brush);
+                            DeleteObject(HGDIOBJ(hover_brush.0));
+                        }
+
+                        // Draw text
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, COLORREF(0x00FFFFFF));
+
+                        let mut lf = LOGFONTW::default();
+                        lf.lfHeight = -12;
+                        lf.lfWeight = 400;
+                        let font_name = "Segoe UI";
+                        for (j, c) in font_name.encode_utf16().enumerate() {
+                            if j < 32 {
+                                lf.lfFaceName[j] = c;
+                            }
+                        }
+                        let font = CreateFontIndirectW(&lf);
+                        let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+
+                        let text_x = item_rect.left + 24;
+                        let text_y = (item_rect.top + item_rect.bottom - 12) / 2;
+                        let name_wide: Vec<u16> = profile.name.encode_utf16().collect();
+                        TextOutW(hdc, text_x, text_y, &name_wide);
+
+                        SelectObject(hdc, old_font);
+                        DeleteObject(HGDIOBJ(font.0));
+                    }
+                }
+
+                EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+
+            WM_MOUSEMOVE => {
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DropdownPopupState;
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+
+                    // Calculate which item is hovered
+                    let item_index = (y - DROPDOWN_PADDING) / DROPDOWN_ITEM_HEIGHT;
+                    let new_hovered =
+                        if item_index >= 0 && (item_index as usize) < state.profiles.len() {
+                            Some(item_index as usize)
+                        } else {
+                            None
+                        };
+
+                    if state.hovered_item != new_hovered {
+                        state.hovered_item = new_hovered;
+                        InvalidateRect(hwnd, None, false);
+                    }
+                }
+                LRESULT(0)
+            }
+
+            WM_LBUTTONDOWN => {
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DropdownPopupState;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+
+                    // Check if click is inside the popup
+                    let mut rect = RECT::default();
+                    GetClientRect(hwnd, &mut rect).ok();
+
+                    if x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom {
+                        // Click inside - check which item
+                        let item_index = (y - DROPDOWN_PADDING) / DROPDOWN_ITEM_HEIGHT;
+                        if item_index >= 0 && (item_index as usize) < state.profiles.len() {
+                            // Send custom message to parent with profile index
+                            let profile_index = item_index as usize;
+                            PostMessageW(
+                                state.parent_hwnd,
+                                WM_APP,
+                                WPARAM(profile_index),
+                                LPARAM(0),
+                            )
+                            .ok();
+                        }
+                    } else {
+                        // Click outside - just notify parent to close
+                        PostMessageW(state.parent_hwnd, WM_APP + 1, WPARAM(0), LPARAM(0)).ok();
+                    }
+                    // Release capture and close popup
+                    ReleaseCapture().ok();
+                    DestroyWindow(hwnd).ok();
+                }
+                LRESULT(0)
+            }
+
+            WM_CAPTURECHANGED => {
+                // We lost capture - close the popup
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DropdownPopupState;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+                    PostMessageW(state.parent_hwnd, WM_APP + 1, WPARAM(0), LPARAM(0)).ok();
+                }
+                DestroyWindow(hwnd).ok();
+                LRESULT(0)
+            }
+
+            WM_DESTROY => {
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DropdownPopupState;
+                if !state_ptr.is_null() {
+                    // Free the state
+                    let _ = Box::from_raw(state_ptr);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                }
+                LRESULT(0)
+            }
+
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
 /// Paint the tab bar (all tabs and new tab button)
 #[allow(unused_must_use)]
 fn paint_tab_bar(
@@ -621,6 +1151,13 @@ fn paint_tab_bar(
     if new_tab_rect.right <= max_x {
         let is_hovered = matches!(hovered_tab, HoveredTab::NewTabButton);
         paint_new_tab_button(hdc, &new_tab_rect, is_hovered);
+    }
+
+    // Paint dropdown button
+    let dropdown_rect = get_dropdown_button_rect(tab_manager.count(), client_width);
+    if dropdown_rect.right <= max_x {
+        let is_hovered = matches!(hovered_tab, HoveredTab::ProfileDropdown);
+        paint_dropdown_button(hdc, &dropdown_rect, is_hovered);
     }
 
     // Draw line at the bottom of the tab bar with a gap for the selected tab
@@ -700,7 +1237,7 @@ fn paint_tab_bar_bottom_line(
 }
 
 /// Paint the title bar content to a device context
-#[allow(unused_must_use)]
+#[allow(unused_must_use, clippy::too_many_arguments)]
 fn paint_titlebar_content(
     hwnd: HWND,
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -709,6 +1246,8 @@ fn paint_titlebar_content(
     hovered_button: HoveredButton,
     hovered_tab: HoveredTab,
     tab_manager: &TabManager,
+    dropdown_state: DropdownState,
+    profiles: &[Profile],
 ) {
     unsafe {
         let client_width = client_rect.right;
@@ -798,11 +1337,16 @@ fn paint_titlebar_content(
 
         let _ = SelectObject(hdc, old_pen);
         let _ = DeleteObject(HGDIOBJ(pen.0));
+
+        // Note: Dropdown menu is now rendered as a separate popup window,
+        // so we don't paint it here anymore.
+        let _ = dropdown_state; // Silence unused warning
+        let _ = profiles; // Silence unused warning
     }
 }
 
 /// Paint the title bar using double-buffering to prevent flicker
-#[allow(unused_must_use)]
+#[allow(unused_must_use, clippy::too_many_arguments)]
 fn paint_titlebar(
     hwnd: HWND,
     ps: &PAINTSTRUCT,
@@ -810,6 +1354,8 @@ fn paint_titlebar(
     hovered_button: HoveredButton,
     hovered_tab: HoveredTab,
     tab_manager: &TabManager,
+    dropdown_state: DropdownState,
+    profiles: &[Profile],
 ) {
     unsafe {
         let hdc = ps.hdc;
@@ -837,6 +1383,8 @@ fn paint_titlebar(
             hovered_button,
             hovered_tab,
             tab_manager,
+            dropdown_state,
+            profiles,
         );
 
         // Copy the off-screen buffer to the screen in one operation
@@ -859,8 +1407,11 @@ unsafe extern "system" fn window_proc(
 ) -> LRESULT {
     match msg {
         WM_CREATE => {
-            // Get background color from thread-local storage
+            // Get background color and config from thread-local storage
             let background_color = INITIAL_BG_COLOR.with(|c| c.get());
+            let config = INITIAL_CONFIG
+                .with(|c| c.borrow_mut().take())
+                .unwrap_or_default();
 
             // Create tab manager and initial tab
             let mut tab_manager = TabManager::new();
@@ -870,8 +1421,9 @@ unsafe extern "system" fn window_proc(
                 let width = (rect.right - rect.left) as u32;
                 let height = (rect.bottom - rect.top) as u32;
 
-                // Create initial tab with Neovide process
-                match tab_manager.create_tab(width, height, hwnd) {
+                // Create initial tab with Neovide process using default profile
+                let default_profile = config.default_profile();
+                match tab_manager.create_tab(width, height, hwnd, default_profile, 0) {
                     Ok(_) => {}
                     Err(e) => {
                         let error_msg = format!("Failed to launch Neovide: {}", e);
@@ -882,11 +1434,14 @@ unsafe extern "system" fn window_proc(
 
             let state = Box::new(WindowState {
                 tab_manager,
+                config,
                 in_size_move: false,
                 background_color,
                 hovered_button: HoveredButton::None,
                 hovered_tab: HoveredTab::None,
                 tracking_mouse: false,
+                dropdown_state: DropdownState::Closed,
+                dropdown_hwnd: None,
             });
             let state_ptr = Box::into_raw(state);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -1004,7 +1559,9 @@ unsafe extern "system" fn window_proc(
                                     match tab_hit {
                                         TabHitResult::Tab(_)
                                         | TabHitResult::TabClose(_)
-                                        | TabHitResult::NewTabButton => {
+                                        | TabHitResult::NewTabButton
+                                        | TabHitResult::ProfileDropdown
+                                        | TabHitResult::DropdownItem(_) => {
                                             // These are handled as client area clicks
                                             return LRESULT(HTCLIENT as isize);
                                         }
@@ -1132,10 +1689,13 @@ unsafe extern "system" fn window_proc(
                     state.hovered_button,
                     state.hovered_tab,
                     &state.tab_manager,
+                    state.dropdown_state,
+                    &state.config.profiles,
                 );
             } else {
                 // Fallback with empty tab manager
                 let empty_manager = TabManager::new();
+                let empty_profiles: Vec<Profile> = vec![];
                 paint_titlebar(
                     hwnd,
                     &ps,
@@ -1143,6 +1703,8 @@ unsafe extern "system" fn window_proc(
                     HoveredButton::None,
                     HoveredTab::None,
                     &empty_manager,
+                    DropdownState::Closed,
+                    &empty_profiles,
                 );
             }
 
@@ -1348,10 +1910,13 @@ unsafe extern "system" fn window_proc(
                 let mut client_rect = RECT::default();
                 if GetClientRect(hwnd, &mut client_rect).is_ok() {
                     let client_width = client_rect.right;
+
                     let tab_hit = hit_test_tab_bar(x, y, state.tab_manager.count(), client_width);
 
                     match tab_hit {
                         TabHitResult::Tab(index) => {
+                            // Close dropdown if open
+                            hide_dropdown_popup(hwnd, state);
                             // Start potential drag - get the tab's initial position
                             let tab_rect = get_tab_rect(index, client_width);
                             state.tab_manager.drag_state = Some(DragState {
@@ -1364,6 +1929,8 @@ unsafe extern "system" fn window_proc(
                             SetCapture(hwnd);
                         }
                         TabHitResult::TabClose(index) => {
+                            // Close dropdown if open
+                            hide_dropdown_popup(hwnd, state);
                             // Request graceful close - sends WM_CLOSE to Neovide window
                             // Process polling will detect when process exits and remove the tab
                             // If window not ready, falls back to forceful close
@@ -1382,12 +1949,21 @@ unsafe extern "system" fn window_proc(
                             // If graceful, do nothing - process polling handles tab removal
                         }
                         TabHitResult::NewTabButton => {
-                            // Create new tab
+                            // Close dropdown if open
+                            hide_dropdown_popup(hwnd, state);
+                            // Create new tab with default profile
                             if let Ok(rect) = get_content_rect(hwnd) {
                                 let width = (rect.right - rect.left) as u32;
                                 let height = (rect.bottom - rect.top) as u32;
 
-                                match state.tab_manager.create_tab(width, height, hwnd) {
+                                let default_profile = state.config.default_profile().clone();
+                                match state.tab_manager.create_tab(
+                                    width,
+                                    height,
+                                    hwnd,
+                                    &default_profile,
+                                    0,
+                                ) {
                                     Ok(_) => {
                                         // Hide other tabs immediately
                                         // The new tab will be activated by the spawner thread
@@ -1406,7 +1982,22 @@ unsafe extern "system" fn window_proc(
                                 }
                             }
                         }
-                        _ => {}
+                        TabHitResult::ProfileDropdown => {
+                            // Toggle dropdown popup
+                            if state.dropdown_state == DropdownState::Open {
+                                hide_dropdown_popup(hwnd, state);
+                            } else {
+                                show_dropdown_popup(hwnd, state);
+                            }
+                            InvalidateRect(hwnd, None, false);
+                        }
+                        _ => {
+                            // Close dropdown popup if open and clicking elsewhere
+                            if state.dropdown_state == DropdownState::Open {
+                                hide_dropdown_popup(hwnd, state);
+                                InvalidateRect(hwnd, None, false);
+                            }
+                        }
                     }
                 }
             }
@@ -1502,19 +2093,20 @@ unsafe extern "system" fn window_proc(
                     let mut client_rect = RECT::default();
                     if GetClientRect(hwnd, &mut client_rect).is_ok() {
                         let client_width = client_rect.right;
+
+                        // Hit test the tab bar (dropdown popup handles its own mouse tracking)
                         let tab_hit =
                             hit_test_tab_bar(x, y, state.tab_manager.count(), client_width);
-
                         let new_hover = match tab_hit {
                             TabHitResult::Tab(i) => HoveredTab::Tab(i),
                             TabHitResult::TabClose(i) => HoveredTab::TabClose(i),
                             TabHitResult::NewTabButton => HoveredTab::NewTabButton,
+                            TabHitResult::ProfileDropdown => HoveredTab::ProfileDropdown,
                             _ => HoveredTab::None,
                         };
 
                         if new_hover != state.hovered_tab {
                             state.hovered_tab = new_hover;
-                            // Invalidate titlebar for hover effect
                             let titlebar_rect = RECT {
                                 left: 0,
                                 top: 0,
@@ -1524,19 +2116,72 @@ unsafe extern "system" fn window_proc(
                             InvalidateRect(hwnd, Some(&titlebar_rect), false);
                         }
                     }
+                }
 
-                    // Track mouse to get WM_MOUSELEAVE
-                    if !state.tracking_mouse {
-                        let mut tme = TRACKMOUSEEVENT {
-                            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                            dwFlags: TME_LEAVE,
-                            hwndTrack: hwnd,
-                            dwHoverTime: 0,
-                        };
-                        TrackMouseEvent(&mut tme);
-                        state.tracking_mouse = true;
+                // Track mouse to get WM_MOUSELEAVE
+                if !state.tracking_mouse {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    TrackMouseEvent(&mut tme);
+                    state.tracking_mouse = true;
+                }
+            }
+            LRESULT(0)
+        }
+
+        // WM_APP: Profile selected from dropdown popup (wparam = profile index)
+        WM_APP => {
+            let profile_index = wparam.0;
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.dropdown_hwnd = None; // Popup already destroyed itself
+                state.dropdown_state = DropdownState::Closed;
+
+                if let Ok(rect) = get_content_rect(hwnd) {
+                    let width = (rect.right - rect.left) as u32;
+                    let height = (rect.bottom - rect.top) as u32;
+
+                    if let Some(profile) = state.config.get_profile(profile_index) {
+                        let profile = profile.clone();
+                        match state.tab_manager.create_tab(
+                            width,
+                            height,
+                            hwnd,
+                            &profile,
+                            profile_index,
+                        ) {
+                            Ok(_) => {
+                                for (i, tab) in state.tab_manager.iter() {
+                                    if i != state.tab_manager.selected_index() {
+                                        tab.process.hide();
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let error_msg = format!("Failed to create new tab: {}", e);
+                                show_error(&error_msg, "Error: Failed to Create Tab");
+                            }
+                        }
                     }
                 }
+                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+
+        // WM_APP + 1: Dropdown popup closed (lost focus or click outside)
+        msg if msg == WM_APP + 1 => {
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.dropdown_hwnd = None; // Popup already destroyed itself
+                state.dropdown_state = DropdownState::Closed;
+                InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
         }
