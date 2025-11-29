@@ -8,8 +8,10 @@ use std::time::Duration;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, SWP_NOZORDER, SetWindowPos,
+    GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, MB_ICONERROR, MB_OK, MessageBoxW,
+    SWP_NOZORDER, SetWindowPos,
 };
+use windows::core::PCWSTR;
 
 /// Manages the lifecycle of a Neovide process instance
 pub struct NeovideProcess {
@@ -59,7 +61,8 @@ impl NeovideProcess {
 
             // Retry finding the window multiple times
             let mut attempts = 0;
-            let max_attempts = 30; // Try for up to 3 seconds
+            let max_attempts = 600; // Try for up to 60 seconds
+            let mut found = false;
 
             while attempts < max_attempts {
                 thread::sleep(Duration::from_millis(100));
@@ -97,17 +100,20 @@ impl NeovideProcess {
                         }
                     }
 
+                    found = true;
                     break;
                 }
 
                 attempts += 1;
             }
 
-            if attempts >= max_attempts {
+            if !found {
                 eprintln!(
-                    "Failed to find Neovide window after {} attempts",
-                    max_attempts
+                    "Failed to find Neovide window after {} seconds",
+                    max_attempts / 10
                 );
+                show_neovide_window_timeout_error();
+                std::process::exit(1);
             }
         });
 
@@ -454,4 +460,28 @@ fn move_window_to_parent_client_area(neovide_hwnd: HWND, parent_hwnd: HWND) -> R
     }
 
     Ok(())
+}
+
+/// Display an error message when Neovide window is not found after timeout
+fn show_neovide_window_timeout_error() {
+    let message = "Failed to find Neovide window after 60 seconds.\n\n\
+        The Neovide process was started but its window could not be detected.\n\n\
+        This may be caused by:\n\
+        - Neovide taking too long to initialize\n\
+        - A configuration issue with Neovide\n\
+        - Neovide crashing during startup\n\n\
+        Please check your Neovide installation and try again.";
+    let title = "Error: Neovide Window Not Found";
+
+    unsafe {
+        let wide_message: Vec<u16> = message.encode_utf16().chain(std::iter::once(0)).collect();
+        let wide_title: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+
+        MessageBoxW(
+            None,
+            PCWSTR(wide_message.as_ptr()),
+            PCWSTR(wide_title.as_ptr()),
+            MB_OK | MB_ICONERROR,
+        );
+    }
 }
