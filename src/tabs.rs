@@ -227,12 +227,54 @@ impl TabManager {
             .is_some_and(|tab| tab.process.is_ready())
     }
 
-    /// Terminate all tabs' processes
+    /// Terminate all tabs' processes forcefully
+    #[allow(dead_code)]
     pub fn terminate_all(&mut self) {
         for tab in &mut self.tabs {
             let _ = tab.process.terminate();
         }
         self.tabs.clear();
+    }
+
+    /// Request graceful close for a tab by sending WM_CLOSE to its Neovide window.
+    /// If the window is not ready, falls back to forceful termination via close_tab().
+    /// Returns true if graceful close was requested (tab remains until process exits),
+    /// false if forceful close was used (tab already removed).
+    pub fn request_close_tab(&mut self, index: usize) -> bool {
+        if index >= self.tabs.len() {
+            return false;
+        }
+
+        // Try to send WM_CLOSE to the Neovide window
+        if self.tabs[index].process.request_close() {
+            // Message sent successfully - tab remains until process polling detects exit
+            true
+        } else {
+            // Window not ready - fall back to forceful close
+            self.close_tab(index);
+            false
+        }
+    }
+
+    /// Request graceful close for all tabs by sending WM_CLOSE to each Neovide window.
+    /// For tabs where window is not ready, forcefully terminates them.
+    /// Does not remove tabs - process polling will handle removal as processes exit.
+    pub fn request_close_all(&mut self) {
+        // Collect indices of tabs that need forceful termination
+        let mut force_close_indices = Vec::new();
+
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if !tab.process.request_close() {
+                // Window not ready - mark for forceful termination
+                force_close_indices.push(i);
+            }
+        }
+
+        // Forcefully close tabs without ready windows (in reverse order for safe removal)
+        force_close_indices.reverse();
+        for index in force_close_indices {
+            self.close_tab(index);
+        }
     }
 
     /// Get the label for a tab (e.g., "Tab 1", "Tab 2")

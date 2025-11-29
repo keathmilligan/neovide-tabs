@@ -8,8 +8,8 @@ use std::time::Duration;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, MB_ICONERROR, MB_OK, MessageBoxW, SW_HIDE,
-    SW_SHOW, SWP_NOZORDER, SetWindowPos, ShowWindow,
+    GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, MB_ICONERROR, MB_OK, MessageBoxW,
+    PostMessageW, SW_HIDE, SW_SHOW, SWP_NOZORDER, SetWindowPos, ShowWindow, WM_CLOSE,
 };
 use windows::core::PCWSTR;
 
@@ -134,7 +134,7 @@ impl NeovideProcess {
         })
     }
 
-    /// Terminate the Neovide process gracefully
+    /// Terminate the Neovide process forcefully using kill()
     pub fn terminate(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.lock().unwrap().take() {
             child
@@ -143,6 +143,24 @@ impl NeovideProcess {
             child.wait().context("Failed to wait for Neovide process")?;
         }
         Ok(())
+    }
+
+    /// Request graceful close by sending WM_CLOSE to the Neovide window.
+    /// Returns true if the message was sent successfully, false if the window
+    /// handle is not yet available (caller should fall back to terminate()).
+    /// Note: This does not immediately close the window - Neovide may prompt
+    /// the user to save unsaved files. The process polling will detect when
+    /// the process actually exits.
+    pub fn request_close(&self) -> bool {
+        if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
+            let neovide_hwnd = HWND(hwnd_raw as *mut _);
+            unsafe {
+                // PostMessageW returns Ok(()) on success
+                PostMessageW(neovide_hwnd, WM_CLOSE, None, None).is_ok()
+            }
+        } else {
+            false
+        }
     }
 
     /// Check if the Neovide process is still running.

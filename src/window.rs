@@ -1309,18 +1309,27 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_CLOSE => {
-            // Stop the process polling timer
-            KillTimer(hwnd, PROCESS_POLL_TIMER_ID).ok();
-
-            // Terminate all Neovide processes spawned by this application
-            // (only processes tracked via Child handles are terminated)
+            // Request graceful close for all Neovide windows
+            // Process polling will detect exits and close app when last tab is removed
             let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !state_ptr.is_null() {
-                let mut state = Box::from_raw(state_ptr);
-                state.tab_manager.terminate_all();
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let state = &mut *state_ptr;
+                state.tab_manager.request_close_all();
+
+                // If all tabs were forcefully closed (none had ready windows),
+                // the tab manager is now empty and we should close immediately
+                if state.tab_manager.is_empty() {
+                    KillTimer(hwnd, PROCESS_POLL_TIMER_ID).ok();
+                    let state = Box::from_raw(state_ptr);
+                    drop(state);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    DestroyWindow(hwnd).ok();
+                }
+                // Otherwise, process polling will handle closing when all processes exit
+            } else {
+                // No state - just destroy the window
+                DestroyWindow(hwnd).ok();
             }
-            DestroyWindow(hwnd).ok();
             LRESULT(0)
         }
 
@@ -1355,16 +1364,22 @@ unsafe extern "system" fn window_proc(
                             SetCapture(hwnd);
                         }
                         TabHitResult::TabClose(index) => {
-                            // Close the tab
-                            let should_close_window = state.tab_manager.close_tab(index);
-                            if should_close_window {
-                                // Last tab closed - close the window
-                                PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
-                            } else {
-                                // Activate the newly selected tab (with proper position check)
-                                state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
-                                InvalidateRect(hwnd, None, false);
+                            // Request graceful close - sends WM_CLOSE to Neovide window
+                            // Process polling will detect when process exits and remove the tab
+                            // If window not ready, falls back to forceful close
+                            let graceful = state.tab_manager.request_close_tab(index);
+                            if !graceful {
+                                // Forceful close occurred - tab already removed
+                                // Check if that was the last tab
+                                if state.tab_manager.is_empty() {
+                                    PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+                                } else {
+                                    // Activate the newly selected tab
+                                    state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
+                                    InvalidateRect(hwnd, None, false);
+                                }
                             }
+                            // If graceful, do nothing - process polling handles tab removal
                         }
                         TabHitResult::NewTabButton => {
                             // Create new tab
