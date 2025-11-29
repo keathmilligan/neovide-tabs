@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{CreateSolidBrush, HBRUSH};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -22,10 +23,22 @@ struct WindowState {
     in_size_move: bool,
 }
 
+/// Convert RGB color (0x00RRGGBB) to Win32 COLORREF (0x00BBGGRR)
+fn rgb_to_colorref(rgb: u32) -> u32 {
+    let r = (rgb >> 16) & 0xFF;
+    let g = (rgb >> 8) & 0xFF;
+    let b = rgb & 0xFF;
+    (b << 16) | (g << 8) | r
+}
+
 /// Register the window class with Win32
-pub fn register_window_class() -> Result<()> {
+pub fn register_window_class(background_color: u32) -> Result<()> {
     unsafe {
         let hinstance = GetModuleHandleW(None).context("Failed to get module handle")?;
+
+        // Create a solid brush for the background color
+        let colorref = rgb_to_colorref(background_color);
+        let brush = CreateSolidBrush(windows::Win32::Foundation::COLORREF(colorref));
 
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -35,7 +48,7 @@ pub fn register_window_class() -> Result<()> {
             hInstance: hinstance.into(),
             hIcon: Default::default(),
             hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
-            hbrBackground: Default::default(),
+            hbrBackground: HBRUSH(brush.0),
             lpszMenuName: PCWSTR::null(),
             lpszClassName: WINDOW_CLASS_NAME,
         };

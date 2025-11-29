@@ -1,10 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![cfg(target_os = "windows")]
 
+mod config;
 mod process;
 mod window;
 
 use anyhow::Result;
+use config::Config;
 use std::env;
 
 fn main() -> Result<()> {
@@ -33,14 +35,17 @@ fn main() -> Result<()> {
         }
     }
 
+    // Load configuration
+    let config = Config::load();
+
     // Check if Neovide is available before creating the window
     if process::NeovideProcess::check_neovide_available().is_err() {
         window::show_neovide_not_found_error();
         std::process::exit(1);
     }
 
-    // Register window class
-    window::register_window_class()?;
+    // Register window class with configured background color
+    window::register_window_class(config.background_color)?;
 
     // Create main window
     let _hwnd = window::create_window()?;
