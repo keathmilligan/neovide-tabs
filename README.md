@@ -1,17 +1,19 @@
 # neovide-tabs
 
-A lightweight tabbed wrapper application for [Neovide](https://neovide.dev) that manages multiple Neovide instances within a single window interface.
+A lightweight wrapper application for [Neovide](https://neovide.dev) that embeds Neovide instances within a host window (Windows only).
 
 ## Overview
 
-neovide-tabs provides a native tabbed interface for Neovide by embedding multiple frameless Neovide windows into a single wrapper application. Each tab runs an independent Neovide instance, allowing you to manage multiple editing sessions seamlessly.
+neovide-tabs provides a native wrapper window for Neovide by embedding a frameless Neovide window into a host application. The Neovide window automatically fills the wrapper's client area and maintains focus synchronization.
 
 ## Features
 
-- **Tabbed Interface**: Manage multiple Neovide instances in a single window
-- **Seamless Integration**: Uses Neovide's `--frame none` option for clean embedding
-- **Automatic Sizing**: Each Neovide instance automatically fills the wrapper's client area
-- **Simple Workflow**: New tabs launch Neovide in the current working directory
+- **Window Embedding**: Embeds Neovide with `--frame none` for seamless integration
+- **Automatic Sizing**: Neovide window fills the wrapper's client area and resizes dynamically
+- **Focus Synchronization**: Wrapper window activation automatically focuses the embedded Neovide
+- **Graceful Lifecycle**: Clean process management with proper termination on close
+- **Neovide Detection**: Validates Neovide installation at startup with helpful error messages
+- **Debug Utilities**: `list-windows` command for troubleshooting window detection
 
 ## Prerequisites
 
@@ -92,33 +94,50 @@ neovide-tabs
 ```
 
 The application will:
-1. Open with a single tab containing a Neovide instance
+1. Open a wrapper window (1024x768, minimum 800x600)
 2. Launch Neovide with frameless window mode (`--frame none`)
-3. Set the working directory to the current directory
-4. Automatically size and position the embedded window
+3. Position and resize the Neovide window to fill the wrapper's client area
+4. Automatically bring Neovide to foreground when the wrapper is activated
 
-### Creating New Tabs
+### Debug Commands
 
-- Click the "New Tab" button or use the keyboard shortcut (TBD)
-- Each new tab launches a fresh Neovide instance in the current working directory
+```bash
+# List all windows matching a search term (default: "neovide")
+neovide-tabs list-windows [search-term]
 
-### Closing Tabs
+# Show help
+neovide-tabs help
+```
 
-- Click the close button on a tab or use the keyboard shortcut (TBD)
-- The corresponding Neovide instance will be gracefully terminated
+### Closing
 
-## Configuration
+- Close the wrapper window normally (Alt+F4, close button, etc.)
+- The embedded Neovide process will be gracefully terminated
 
-_Configuration options are planned for future releases._
+## Architecture
+
+The application consists of three main modules:
+
+- **main.rs**: Entry point with CLI argument handling and startup validation
+- **window.rs**: Win32 window management, message loop, and state handling
+- **process.rs**: Neovide process spawning, window discovery, and positioning
+
+## Limitations
+
+- **Windows only**: Currently only supports Windows (uses Win32 API directly)
+- **Single instance**: Manages one Neovide instance per wrapper window
+- **No configuration**: All settings are currently hardcoded
 
 ## Roadmap
 
 - [x] Project setup and architecture
-- [ ] Basic window wrapper with tab bar
-- [ ] Neovide process spawning with `--frame none`
-- [ ] Window embedding and sizing
+- [x] Basic window wrapper
+- [x] Neovide process spawning with `--frame none`
+- [x] Window embedding and sizing
+- [x] Graceful process lifecycle handling
+- [x] Focus synchronization
+- [ ] Tab bar UI for multiple instances
 - [ ] Tab creation and management
-- [ ] Graceful process lifecycle handling
 - [ ] Keyboard shortcuts
 - [ ] Configurable tab behavior (custom working directories)
 - [ ] Persistent tab sessions
@@ -148,4 +167,4 @@ Contributions are welcome! Please read the development guidelines in `AGENTS.md`
 
 **Current Version:** 0.1.0 (Initial Development)
 
-This project is in early development. The MVP focuses on basic tab management with automatic window embedding. Future versions will add configuration options and enhanced tab behavior.
+This project is in early development. The current implementation provides a working single-Neovide-instance wrapper with automatic window embedding. The next milestone is implementing the tab bar UI to support multiple Neovide instances.
