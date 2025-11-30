@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 /// Default background color (Tokyo Night dark theme)
 pub const DEFAULT_BACKGROUND_COLOR: u32 = 0x1a1b26;
 
-/// Default icon filename
+/// Default tab icon filename (Neovide icon for profiles)
 pub const DEFAULT_ICON: &str = "neovide.png";
+
+/// Application window icon filename
+pub const APP_ICON: &str = "neovide-tabs.png";
 
 /// Default profile name
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
@@ -202,11 +205,10 @@ fn config_file_path() -> Option<PathBuf> {
     )
 }
 
-/// Get the path to the icons directory: `~/.config/neovide-tabs/icons/`
-#[allow(dead_code)]
-pub fn icons_dir_path() -> Option<PathBuf> {
+/// Get the path to the data directory: `~/.local/share/neovide-tabs/`
+pub fn data_dir_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    Some(home.join(".config").join("neovide-tabs").join("icons"))
+    Some(home.join(".local").join("share").join("neovide-tabs"))
 }
 
 /// Parse a hex color string (with or without # prefix) to RGB u32.
@@ -307,7 +309,16 @@ mod tests {
     fn test_default_profile() {
         let profile = Profile::default_profile();
         assert_eq!(profile.name, DEFAULT_PROFILE_NAME);
-        assert_eq!(profile.icon, DEFAULT_ICON);
+        assert_eq!(profile.icon, "neovide.png");
+    }
+
+    #[test]
+    fn test_data_dir_path() {
+        let path = data_dir_path();
+        assert!(path.is_some());
+        let path = path.unwrap();
+        assert!(path.to_string_lossy().contains("neovide-tabs"));
+        assert!(path.to_string_lossy().contains(".local"));
     }
 
     #[test]

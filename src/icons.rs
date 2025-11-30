@@ -1,7 +1,11 @@
 //! Icon loading and caching for profile icons.
 //!
-//! Loads PNG icons from `~/.config/neovide-tabs/icons/` and caches them
-//! as Win32 HBITMAP handles for efficient rendering.
+//! Two icons are bundled into the executable:
+//! - `neovide.png` - the default tab icon (Neovide logo for profiles)
+//! - `neovide-tabs.png` - the application window icon (for taskbar/Alt-Tab)
+//!
+//! Both are extracted to `~/.local/share/neovide-tabs/` at runtime.
+//! User-defined icons are loaded from full paths specified in the config.
 //!
 //! Note: This module uses thread-local storage since Win32 GDI handles
 //! (HBITMAP) are not thread-safe and should not cross thread boundaries.
@@ -10,6 +14,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::HWND;
@@ -17,11 +22,21 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HGDIOBJ, ReleaseDC, SetDIBits,
 };
+use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 
-use crate::config::icons_dir_path;
+use crate::config::{APP_ICON, DEFAULT_ICON, data_dir_path};
 
 /// Size of icons in the tab bar (16x16 pixels)
 pub const ICON_SIZE: i32 = 16;
+
+/// Size of window icons (32x32 pixels for better quality in taskbar/Alt-Tab)
+pub const WINDOW_ICON_SIZE: i32 = 32;
+
+/// The bundled default tab icon - Neovide logo (embedded at compile time)
+const BUNDLED_TAB_ICON_BYTES: &[u8] = include_bytes!("../neovide.png");
+
+/// The bundled application window icon (embedded at compile time)
+const BUNDLED_APP_ICON_BYTES: &[u8] = include_bytes!("../neovide-tabs.png");
 
 /// A cached icon bitmap
 pub struct CachedIcon {
@@ -45,10 +60,10 @@ impl Drop for CachedIcon {
     }
 }
 
-/// Icon cache storing loaded bitmaps by filename (thread-local)
+/// Icon cache storing loaded bitmaps by path/filename (thread-local)
 struct IconCache {
     cache: HashMap<String, Option<CachedIcon>>,
-    icons_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     fallback_icon: Option<CachedIcon>,
 }
 
@@ -56,30 +71,40 @@ impl IconCache {
     fn new() -> Self {
         Self {
             cache: HashMap::new(),
-            icons_dir: icons_dir_path(),
+            data_dir: data_dir_path(),
             fallback_icon: None,
         }
     }
 
-    /// Get or load an icon by filename
-    fn get_or_load(&mut self, filename: &str) -> Option<HBITMAP> {
+    /// Get or load an icon by path or filename.
+    /// For the default icon (neovide-tabs.png), loads from data directory.
+    /// For user icons, treats the string as a full path.
+    fn get_or_load(&mut self, icon_path: &str) -> Option<HBITMAP> {
         // Check if already cached
-        if !self.cache.contains_key(filename) {
+        if !self.cache.contains_key(icon_path) {
             // Try to load the icon
-            let icon = self.load_icon(filename);
-            self.cache.insert(filename.to_string(), icon);
+            let icon = self.load_icon(icon_path);
+            self.cache.insert(icon_path.to_string(), icon);
         }
 
         self.cache
-            .get(filename)
+            .get(icon_path)
             .and_then(|opt| opt.as_ref())
             .map(|icon| icon.hbitmap)
     }
 
-    /// Load an icon from the icons directory
-    fn load_icon(&self, filename: &str) -> Option<CachedIcon> {
-        let icons_dir = self.icons_dir.as_ref()?;
-        let path = icons_dir.join(filename);
+    /// Load an icon from the appropriate location.
+    /// Default icon: loaded from data directory (~/.local/share/neovide-tabs/)
+    /// User icon: loaded from the full path specified
+    fn load_icon(&self, icon_path: &str) -> Option<CachedIcon> {
+        let path = if icon_path == DEFAULT_ICON {
+            // Default icon - load from data directory
+            let data_dir = self.data_dir.as_ref()?;
+            data_dir.join(icon_path)
+        } else {
+            // User-defined icon - treat as full path
+            PathBuf::from(icon_path)
+        };
 
         if !path.exists() {
             eprintln!("Icon file not found: {:?}", path);
@@ -103,20 +128,188 @@ thread_local! {
     static ICON_CACHE: RefCell<IconCache> = RefCell::new(IconCache::new());
 }
 
-/// Get an icon bitmap handle for the given filename.
+/// Ensure bundled icons are extracted to the data directory.
+/// Creates the directory if it doesn't exist.
+/// Does NOT overwrite if files already exist.
+pub fn ensure_default_icon_extracted() {
+    let Some(data_dir) = data_dir_path() else {
+        eprintln!("Warning: Could not determine data directory path");
+        return;
+    };
+
+    // Create data directory if it doesn't exist
+    if let Err(e) = fs::create_dir_all(&data_dir) {
+        eprintln!(
+            "Warning: Failed to create data directory {:?}: {}",
+            data_dir, e
+        );
+        return;
+    }
+
+    // Extract the default tab icon (neovide.png)
+    let tab_icon_path = data_dir.join(DEFAULT_ICON);
+    if !tab_icon_path.exists()
+        && let Err(e) = fs::write(&tab_icon_path, BUNDLED_TAB_ICON_BYTES)
+    {
+        eprintln!(
+            "Warning: Failed to extract default tab icon to {:?}: {}",
+            tab_icon_path, e
+        );
+    }
+
+    // Extract the application window icon (neovide-tabs.png)
+    let app_icon_path = data_dir.join(APP_ICON);
+    if !app_icon_path.exists()
+        && let Err(e) = fs::write(&app_icon_path, BUNDLED_APP_ICON_BYTES)
+    {
+        eprintln!(
+            "Warning: Failed to extract app icon to {:?}: {}",
+            app_icon_path, e
+        );
+    }
+}
+
+/// Get an icon bitmap handle for the given path or filename.
+/// For default icon (neovide-tabs.png), loads from data directory.
+/// For user icons, loads from the full path.
 /// Returns a fallback icon if the specified icon cannot be loaded.
-pub fn get_icon_bitmap(filename: &str) -> Option<HBITMAP> {
+pub fn get_icon_bitmap(icon_path: &str) -> Option<HBITMAP> {
     ICON_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
 
         // Try to get the requested icon
-        if let Some(hbitmap) = cache.get_or_load(filename) {
+        if let Some(hbitmap) = cache.get_or_load(icon_path) {
             return Some(hbitmap);
         }
 
         // Fall back to default icon
         cache.get_fallback()
     })
+}
+
+/// Create an HICON from the bundled app icon bytes for use as window icon.
+/// Returns both large (32x32) and small (16x16) icons.
+pub fn create_window_icons() -> Option<(HICON, HICON)> {
+    // Load the bundled app icon from memory
+    let img = image::load_from_memory(BUNDLED_APP_ICON_BYTES).ok()?;
+
+    // Create large icon (32x32)
+    let large_img = img.resize_exact(
+        WINDOW_ICON_SIZE as u32,
+        WINDOW_ICON_SIZE as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let large_rgba = large_img.to_rgba8();
+    let large_icon = create_hicon_from_rgba(&large_rgba, WINDOW_ICON_SIZE)?;
+
+    // Create small icon (16x16)
+    let small_img = img.resize_exact(
+        ICON_SIZE as u32,
+        ICON_SIZE as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let small_rgba = small_img.to_rgba8();
+    let small_icon = create_hicon_from_rgba(&small_rgba, ICON_SIZE)?;
+
+    Some((large_icon, small_icon))
+}
+
+/// Create an HICON from RGBA pixel data
+fn create_hicon_from_rgba(rgba: &image::RgbaImage, size: i32) -> Option<HICON> {
+    unsafe {
+        let screen_dc = GetDC(HWND::default());
+        if screen_dc.is_invalid() {
+            return None;
+        }
+
+        let mem_dc = CreateCompatibleDC(screen_dc);
+        if mem_dc.is_invalid() {
+            ReleaseDC(HWND::default(), screen_dc);
+            return None;
+        }
+
+        // Create color bitmap
+        let color_bitmap = CreateCompatibleBitmap(screen_dc, size, size);
+        if color_bitmap.is_invalid() {
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND::default(), screen_dc);
+            return None;
+        }
+
+        // Create mask bitmap (monochrome)
+        let mask_bitmap = CreateCompatibleBitmap(screen_dc, size, size);
+        if mask_bitmap.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(color_bitmap.0));
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND::default(), screen_dc);
+            return None;
+        }
+
+        // Set up bitmap info
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size,
+                biHeight: -size, // Top-down DIB
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            bmiColors: [Default::default()],
+        };
+
+        // Convert RGBA to BGRA
+        let mut bgra_data: Vec<u8> = Vec::with_capacity((size * size * 4) as usize);
+        for pixel in rgba.pixels() {
+            bgra_data.push(pixel[2]); // B
+            bgra_data.push(pixel[1]); // G
+            bgra_data.push(pixel[0]); // R
+            bgra_data.push(pixel[3]); // A
+        }
+
+        // Set color bitmap bits
+        let result = SetDIBits(
+            mem_dc,
+            color_bitmap,
+            0,
+            size as u32,
+            bgra_data.as_ptr() as *const std::ffi::c_void,
+            &bmi,
+            DIB_RGB_COLORS,
+        );
+
+        if result == 0 {
+            let _ = DeleteObject(HGDIOBJ(color_bitmap.0));
+            let _ = DeleteObject(HGDIOBJ(mask_bitmap.0));
+            let _ = DeleteDC(mem_dc);
+            ReleaseDC(HWND::default(), screen_dc);
+            return None;
+        }
+
+        // Create icon info
+        let icon_info = ICONINFO {
+            fIcon: true.into(),
+            xHotspot: 0,
+            yHotspot: 0,
+            hbmMask: mask_bitmap,
+            hbmColor: color_bitmap,
+        };
+
+        let hicon = CreateIconIndirect(&icon_info);
+
+        // Clean up bitmaps (CreateIconIndirect makes copies)
+        let _ = DeleteObject(HGDIOBJ(color_bitmap.0));
+        let _ = DeleteObject(HGDIOBJ(mask_bitmap.0));
+        let _ = DeleteDC(mem_dc);
+        ReleaseDC(HWND::default(), screen_dc);
+
+        hicon.ok()
+    }
 }
 
 /// Load a PNG file and convert it to a Win32 HBITMAP
@@ -247,10 +440,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_icons_dir_path() {
-        let path = icons_dir_path();
+    fn test_bundled_tab_icon_is_valid_png() {
+        // Verify the bundled tab icon can be loaded as an image
+        let img = image::load_from_memory(BUNDLED_TAB_ICON_BYTES);
+        assert!(img.is_ok(), "Bundled tab icon should be a valid image");
+    }
+
+    #[test]
+    fn test_bundled_app_icon_is_valid_png() {
+        // Verify the bundled app icon can be loaded as an image
+        let img = image::load_from_memory(BUNDLED_APP_ICON_BYTES);
+        assert!(img.is_ok(), "Bundled app icon should be a valid image");
+    }
+
+    #[test]
+    fn test_data_dir_path() {
+        let path = data_dir_path();
         assert!(path.is_some());
         let path = path.unwrap();
-        assert!(path.to_string_lossy().contains("icons"));
+        assert!(path.to_string_lossy().contains("neovide-tabs"));
     }
 }

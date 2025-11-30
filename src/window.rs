@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::config::{Config, Profile};
-use crate::icons::{ICON_SIZE, get_icon_bitmap};
+use crate::icons::{ICON_SIZE, create_window_icons, get_icon_bitmap};
 use crate::tabs::{DragState, TabManager};
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("NeovideTabsWindow");
@@ -188,6 +188,11 @@ pub fn register_window_class(config: Config) -> Result<()> {
         let colorref = rgb_to_colorref(background_color);
         let brush = CreateSolidBrush(COLORREF(colorref));
 
+        // Create window icon from bundled image
+        let window_icon = create_window_icons()
+            .map(|(large, _small)| large)
+            .unwrap_or_default();
+
         // Register main window class
         let wc = WNDCLASSW {
             style: CS_HREDRAW | CS_VREDRAW,
@@ -195,7 +200,7 @@ pub fn register_window_class(config: Config) -> Result<()> {
             cbClsExtra: 0,
             cbWndExtra: 0,
             hInstance: hinstance.into(),
-            hIcon: Default::default(),
+            hIcon: window_icon,
             hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
             hbrBackground: HBRUSH(brush.0),
             lpszMenuName: PCWSTR::null(),

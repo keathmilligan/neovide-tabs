@@ -37,6 +37,9 @@ fn main() -> Result<()> {
         }
     }
 
+    // Ensure the default icon is extracted to the data directory
+    icons::ensure_default_icon_extracted();
+
     // Load configuration
     let config = Config::load();
 
