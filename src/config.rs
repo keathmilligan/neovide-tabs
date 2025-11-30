@@ -1,6 +1,8 @@
 //! Configuration loading and parsing for neovide-tabs.
 //!
-//! Loads configuration from `~/.config/neovide-tabs/config.json`.
+//! Loads configuration from `~/.config/neovide-tabs/config.jsonc` (preferred)
+//! or `~/.config/neovide-tabs/config.json` (fallback).
+//! Both files support JSONC format (JSON with // comments).
 //! Falls back to defaults if the file is missing or invalid.
 
 use serde::Deserialize;
@@ -22,6 +24,61 @@ pub const DEFAULT_PROFILE_NAME: &str = "Default";
 
 /// Default hotkey for the generated Default profile
 pub const DEFAULT_PROFILE_HOTKEY: &str = "Ctrl+Shift+F1";
+
+/// Default configuration file template (JSONC format with comments)
+/// All values are commented out to show defaults without overriding user's empty config.
+const DEFAULT_CONFIG_TEMPLATE: &str = r##"// neovide-tabs configuration file
+// Uncomment and modify options below to customize behavior.
+// See https://github.com/your-repo/neovide-tabs for documentation.
+
+{
+    // Background color for the window (hex format, with or without # prefix)
+    // This color is used for the title bar and to fill exposed areas during resize
+    // "background_color": "#1a1b26",
+
+    // Hotkey configuration
+    // "hotkeys": {
+    //     // Tab switching hotkeys: maps key combination to tab number (1-based)
+    //     // Default: Ctrl+Shift+1-9 for tabs 1-9, Ctrl+Shift+0 for tab 10
+    //     // Set to empty object {} to disable all tab hotkeys
+    //     "tab": {
+    //         "Ctrl+Shift+1": 1,
+    //         "Ctrl+Shift+2": 2,
+    //         "Ctrl+Shift+3": 3,
+    //         "Ctrl+Shift+4": 4,
+    //         "Ctrl+Shift+5": 5,
+    //         "Ctrl+Shift+6": 6,
+    //         "Ctrl+Shift+7": 7,
+    //         "Ctrl+Shift+8": 8,
+    //         "Ctrl+Shift+9": 9,
+    //         "Ctrl+Shift+0": 10
+    //     }
+    // },
+
+    // Profile definitions for tabs
+    // Each profile can specify a name, icon, working directory, and hotkey
+    // A "Default" profile is always available; if not defined here, one is generated
+    // "profiles": [
+    //     {
+    //         // Profile name (required) - displayed in the tab
+    //         "name": "Work",
+    //         // Icon file path (optional) - full path to a PNG file
+    //         // Defaults to neovide.png in the data directory
+    //         "icon": "C:/path/to/icon.png",
+    //         // Working directory (optional) - where Neovide starts
+    //         // Supports ~ for home directory. Defaults to home directory
+    //         "working_directory": "~/projects/work",
+    //         // Global hotkey (optional) - opens or activates a tab with this profile
+    //         // Format: Modifier+Key (e.g., Ctrl+Shift+F2, Alt+Shift+W)
+    //         "hotkey": "Ctrl+Shift+F2"
+    //     },
+    //     {
+    //         // Minimal profile example - only name is required
+    //         "name": "Personal"
+    //     }
+    // ]
+}
+"##;
 
 /// Raw profile as read from JSON file
 #[derive(Debug, Deserialize, Clone)]
@@ -128,10 +185,16 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load configuration from the default config file path.
+    /// Load configuration from the config file.
+    /// Looks for config.jsonc first, then config.json as fallback.
+    /// If no config file exists, generates a default config.jsonc with documented options.
+    /// Both .json and .jsonc files support JSONC format (JSON with // comments).
     /// Returns default config if file is missing or invalid.
     pub fn load() -> Self {
-        let path = match config_file_path() {
+        // Ensure config file exists (generates default if missing)
+        ensure_config_file();
+
+        let path = match find_config_file() {
             Some(p) => p,
             None => return Self::default(),
         };
@@ -141,7 +204,10 @@ impl Config {
             Err(_) => return Self::default(),
         };
 
-        let config_file: ConfigFile = match serde_json::from_str(&contents) {
+        // Strip JSONC comments before parsing
+        let json_content = strip_jsonc_comments(&contents);
+
+        let config_file: ConfigFile = match serde_json::from_str(&json_content) {
             Ok(c) => c,
             Err(_) => return Self::default(),
         };
@@ -259,14 +325,147 @@ fn resolve_path(path_str: &str, home_dir: &Path) -> PathBuf {
     }
 }
 
-/// Get the path to the config file: `~/.config/neovide-tabs/config.json`
-fn config_file_path() -> Option<PathBuf> {
+/// Get the path to the config directory: `~/.config/neovide-tabs/`
+fn config_dir_path() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".config").join("neovide-tabs"))
+}
+
+/// Get the path to the preferred config file: `~/.config/neovide-tabs/config.jsonc`
+fn config_file_path_jsonc() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(
+        home.join(".config")
+            .join("neovide-tabs")
+            .join("config.jsonc"),
+    )
+}
+
+/// Get the path to the fallback config file: `~/.config/neovide-tabs/config.json`
+fn config_file_path_json() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     Some(
         home.join(".config")
             .join("neovide-tabs")
             .join("config.json"),
     )
+}
+
+/// Find the config file to load. Prefers .jsonc, falls back to .json.
+/// Returns None if neither exists.
+fn find_config_file() -> Option<PathBuf> {
+    // Check for .jsonc first (preferred)
+    if let Some(jsonc_path) = config_file_path_jsonc()
+        && jsonc_path.exists()
+    {
+        return Some(jsonc_path);
+    }
+
+    // Fall back to .json
+    if let Some(json_path) = config_file_path_json()
+        && json_path.exists()
+    {
+        return Some(json_path);
+    }
+
+    None
+}
+
+/// Ensure the config directory exists, creating it if necessary.
+/// Returns true if the directory exists (or was created), false on error.
+fn ensure_config_dir() -> bool {
+    match config_dir_path() {
+        Some(dir) => {
+            if dir.exists() {
+                true
+            } else {
+                fs::create_dir_all(&dir).is_ok()
+            }
+        }
+        None => false,
+    }
+}
+
+/// Ensure the config file exists, generating a default one if it doesn't.
+/// This is called before loading config to provide users with a documented template.
+/// Generates config.jsonc (preferred format).
+fn ensure_config_file() {
+    // Check if either .jsonc or .json exists
+    if find_config_file().is_some() {
+        return;
+    }
+
+    // Generate new config as .jsonc
+    let path = match config_file_path_jsonc() {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Ensure the config directory exists
+    if !ensure_config_dir() {
+        return;
+    }
+
+    // Write the default config template
+    if let Err(e) = fs::write(&path, DEFAULT_CONFIG_TEMPLATE) {
+        eprintln!(
+            "Warning: Failed to create default config file at {}: {}",
+            path.display(),
+            e
+        );
+    }
+}
+
+/// Strip JSONC comments from content, returning valid JSON.
+/// Supports // line comments. Comments inside strings are preserved.
+fn strip_jsonc_comments(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut in_string = false;
+    let mut escape_next = false;
+    let mut chars = content.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if escape_next {
+            result.push(c);
+            escape_next = false;
+            continue;
+        }
+
+        if c == '\\' && in_string {
+            result.push(c);
+            escape_next = true;
+            continue;
+        }
+
+        if c == '"' {
+            in_string = !in_string;
+            result.push(c);
+            continue;
+        }
+
+        if !in_string && c == '/' && chars.peek() == Some(&'/') {
+            // Skip the rest of the line (// comment)
+            chars.next(); // consume second /
+            for ch in chars.by_ref() {
+                if ch == '\n' {
+                    result.push('\n');
+                    break;
+                }
+            }
+            continue;
+        }
+
+        result.push(c);
+    }
+
+    result
+}
+
+/// Generate the default config file content (JSONC format).
+/// This is exposed for testing purposes.
+#[cfg(test)]
+pub fn generate_default_config() -> &'static str {
+    DEFAULT_CONFIG_TEMPLATE
 }
 
 /// Get the path to the data directory: `~/.local/share/neovide-tabs/`
@@ -364,8 +563,17 @@ mod tests {
     }
 
     #[test]
-    fn test_config_file_path() {
-        let path = config_file_path();
+    fn test_config_file_path_jsonc() {
+        let path = config_file_path_jsonc();
+        assert!(path.is_some());
+        let path = path.unwrap();
+        assert!(path.ends_with("config.jsonc"));
+        assert!(path.to_string_lossy().contains("neovide-tabs"));
+    }
+
+    #[test]
+    fn test_config_file_path_json() {
+        let path = config_file_path_json();
         assert!(path.is_some());
         let path = path.unwrap();
         assert!(path.ends_with("config.json"));
@@ -551,5 +759,145 @@ mod tests {
             config.profiles[0].hotkey,
             Some(DEFAULT_PROFILE_HOTKEY.to_string())
         );
+    }
+
+    #[test]
+    fn test_generate_default_config_not_empty() {
+        let content = generate_default_config();
+        assert!(!content.is_empty());
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_background_color() {
+        let content = generate_default_config();
+        assert!(content.contains("background_color"));
+        assert!(content.contains("#1a1b26"));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_hotkeys() {
+        let content = generate_default_config();
+        assert!(content.contains("hotkeys"));
+        assert!(content.contains("tab"));
+        assert!(content.contains("Ctrl+Shift+1"));
+        assert!(content.contains("Ctrl+Shift+0"));
+    }
+
+    #[test]
+    fn test_generate_default_config_contains_profiles() {
+        let content = generate_default_config();
+        assert!(content.contains("profiles"));
+        assert!(content.contains("name"));
+        assert!(content.contains("icon"));
+        assert!(content.contains("working_directory"));
+        assert!(content.contains("hotkey"));
+    }
+
+    #[test]
+    fn test_generate_default_config_uses_comment_syntax() {
+        let content = generate_default_config();
+        // Should contain // comments
+        assert!(content.contains("//"));
+    }
+
+    #[test]
+    fn test_generate_default_config_is_valid_jsonc() {
+        let content = generate_default_config();
+        // Strip all comment lines and check remaining is valid JSON
+        let stripped: String = content
+            .lines()
+            .filter(|line| !line.trim().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The stripped content should be valid JSON (just an empty object {})
+        let result: Result<serde_json::Value, _> = serde_json::from_str(&stripped);
+        assert!(
+            result.is_ok(),
+            "Stripped JSONC should be valid JSON: {}",
+            stripped
+        );
+    }
+
+    #[test]
+    fn test_config_dir_path() {
+        let path = config_dir_path();
+        assert!(path.is_some());
+        let path = path.unwrap();
+        assert!(path.to_string_lossy().contains("neovide-tabs"));
+        assert!(path.to_string_lossy().contains(".config"));
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments_line_comment() {
+        let input = r#"{ // this is a comment
+    "key": "value"
+}"#;
+        let output = strip_jsonc_comments(input);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments_full_line_comment() {
+        let input = r#"{
+    // this is a full line comment
+    "key": "value"
+}"#;
+        let output = strip_jsonc_comments(input);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["key"], "value");
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments_preserves_strings() {
+        let input = r#"{ "key": "value with // not a comment" }"#;
+        let output = strip_jsonc_comments(input);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["key"], "value with // not a comment");
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments_escaped_quotes() {
+        let input = r#"{ "key": "value with \" escaped // quote" }"#;
+        let output = strip_jsonc_comments(input);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["key"], r#"value with " escaped // quote"#);
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments_multiple_comments() {
+        let input = r#"{
+    // comment 1
+    "a": 1, // inline comment
+    // comment 2
+    "b": 2
+}"#;
+        let output = strip_jsonc_comments(input);
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(parsed["a"], 1);
+        assert_eq!(parsed["b"], 2);
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments_no_comments() {
+        let input = r#"{ "key": "value" }"#;
+        let output = strip_jsonc_comments(input);
+        assert_eq!(input, output);
+    }
+
+    #[test]
+    fn test_strip_jsonc_comments_empty() {
+        let input = "";
+        let output = strip_jsonc_comments(input);
+        assert_eq!(output, "");
+    }
+
+    #[test]
+    fn test_strip_jsonc_parses_default_template() {
+        let content = generate_default_config();
+        let stripped = strip_jsonc_comments(content);
+        let result: Result<serde_json::Value, _> = serde_json::from_str(&stripped);
+        assert!(result.is_ok(), "Default template should parse after stripping comments");
     }
 }
