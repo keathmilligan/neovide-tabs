@@ -4,6 +4,7 @@
 //! Falls back to defaults if the file is missing or invalid.
 
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,9 @@ pub const APP_ICON: &str = "neovide-tabs.png";
 /// Default profile name
 pub const DEFAULT_PROFILE_NAME: &str = "Default";
 
+/// Default hotkey for the generated Default profile
+pub const DEFAULT_PROFILE_HOTKEY: &str = "Ctrl+Shift+F1";
+
 /// Raw profile as read from JSON file
 #[derive(Debug, Deserialize, Clone)]
 struct ProfileFile {
@@ -28,6 +32,15 @@ struct ProfileFile {
     icon: Option<String>,
     /// Working directory (optional, defaults to home directory)
     working_directory: Option<String>,
+    /// Global hotkey for this profile (optional, e.g., "Ctrl+Shift+F1")
+    hotkey: Option<String>,
+}
+
+/// Raw hotkey configuration as read from JSON file
+#[derive(Debug, Deserialize, Default, Clone)]
+struct HotkeyConfigFile {
+    /// Tab hotkey mappings: hotkey string -> tab number (1-based)
+    tab: Option<HashMap<String, u32>>,
 }
 
 /// Raw configuration as read from JSON file
@@ -37,6 +50,8 @@ struct ConfigFile {
     background_color: Option<String>,
     /// List of profiles
     profiles: Option<Vec<ProfileFile>>,
+    /// Hotkey configuration
+    hotkeys: Option<HotkeyConfigFile>,
 }
 
 /// A tab profile with resolved paths
@@ -48,17 +63,47 @@ pub struct Profile {
     pub icon: String,
     /// Working directory (resolved full path)
     pub working_directory: PathBuf,
+    /// Global hotkey for this profile (e.g., "Ctrl+Shift+F1")
+    pub hotkey: Option<String>,
+}
+
+/// Parsed hotkey configuration
+#[derive(Debug, Clone)]
+pub struct HotkeyConfig {
+    /// Tab hotkey mappings: hotkey string -> tab number (1-based)
+    pub tab: HashMap<String, u32>,
 }
 
 impl Profile {
-    /// Create the default profile
+    /// Create the default profile with default hotkey
     pub fn default_profile() -> Self {
         Self {
             name: DEFAULT_PROFILE_NAME.to_string(),
             icon: DEFAULT_ICON.to_string(),
             working_directory: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+            hotkey: Some(DEFAULT_PROFILE_HOTKEY.to_string()),
         }
     }
+}
+
+impl Default for HotkeyConfig {
+    fn default() -> Self {
+        Self {
+            tab: default_tab_hotkeys(),
+        }
+    }
+}
+
+/// Generate default tab hotkeys: Ctrl+Shift+1-9,0 for tabs 1-10
+fn default_tab_hotkeys() -> HashMap<String, u32> {
+    let mut map = HashMap::new();
+    // 1-9 map to tabs 1-9
+    for i in 1..=9 {
+        map.insert(format!("Ctrl+Shift+{}", i), i);
+    }
+    // 0 maps to tab 10
+    map.insert("Ctrl+Shift+0".to_string(), 10);
+    map
 }
 
 /// Parsed application configuration with validated values
@@ -68,6 +113,8 @@ pub struct Config {
     pub background_color: u32,
     /// List of profiles (always has at least one - the Default profile)
     pub profiles: Vec<Profile>,
+    /// Hotkey configuration
+    pub hotkeys: HotkeyConfig,
 }
 
 impl Default for Config {
@@ -75,6 +122,7 @@ impl Default for Config {
         Self {
             background_color: DEFAULT_BACKGROUND_COLOR,
             profiles: vec![Profile::default_profile()],
+            hotkeys: HotkeyConfig::default(),
         }
     }
 }
@@ -110,10 +158,12 @@ impl Config {
             .unwrap_or(DEFAULT_BACKGROUND_COLOR);
 
         let profiles = parse_profiles(file.profiles);
+        let hotkeys = parse_hotkey_config(file.hotkeys);
 
         Self {
             background_color,
             profiles,
+            hotkeys,
         }
     }
 
@@ -146,6 +196,7 @@ fn parse_profiles(profiles_opt: Option<Vec<ProfileFile>>) -> Vec<Profile> {
                     name: pf.name,
                     icon: pf.icon.unwrap_or_else(|| DEFAULT_ICON.to_string()),
                     working_directory,
+                    hotkey: pf.hotkey,
                 }
             })
             .collect(),
@@ -165,6 +216,19 @@ fn parse_profiles(profiles_opt: Option<Vec<ProfileFile>>) -> Vec<Profile> {
     }
 
     profiles
+}
+
+/// Parse hotkey configuration from config file
+fn parse_hotkey_config(config_opt: Option<HotkeyConfigFile>) -> HotkeyConfig {
+    match config_opt {
+        Some(config) => {
+            // If hotkeys section exists, use it (even if empty, which disables defaults)
+            let tab = config.tab.unwrap_or_default();
+            HotkeyConfig { tab }
+        }
+        // No hotkeys section - use defaults
+        None => HotkeyConfig::default(),
+    }
 }
 
 /// Resolve a path string, expanding ~ to home directory
@@ -271,6 +335,7 @@ mod tests {
         let file = ConfigFile {
             background_color: Some("#ff0000".to_string()),
             profiles: None,
+            hotkeys: None,
         };
         let config = Config::from_config_file(file);
         assert_eq!(config.background_color, 0xff0000);
@@ -281,6 +346,7 @@ mod tests {
         let file = ConfigFile {
             background_color: Some("invalid".to_string()),
             profiles: None,
+            hotkeys: None,
         };
         let config = Config::from_config_file(file);
         assert_eq!(config.background_color, DEFAULT_BACKGROUND_COLOR);
@@ -291,6 +357,7 @@ mod tests {
         let file = ConfigFile {
             background_color: None,
             profiles: None,
+            hotkeys: None,
         };
         let config = Config::from_config_file(file);
         assert_eq!(config.background_color, DEFAULT_BACKGROUND_COLOR);
@@ -310,6 +377,7 @@ mod tests {
         let profile = Profile::default_profile();
         assert_eq!(profile.name, DEFAULT_PROFILE_NAME);
         assert_eq!(profile.icon, "neovide.png");
+        assert_eq!(profile.hotkey, Some(DEFAULT_PROFILE_HOTKEY.to_string()));
     }
 
     #[test]
@@ -334,11 +402,14 @@ mod tests {
             name: "Default".to_string(),
             icon: Some("custom.png".to_string()),
             working_directory: Some("~".to_string()),
+            hotkey: None,
         }];
         let profiles = parse_profiles(Some(profile_files));
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].name, DEFAULT_PROFILE_NAME);
         assert_eq!(profiles[0].icon, "custom.png");
+        // User-defined Default without hotkey should have no hotkey
+        assert_eq!(profiles[0].hotkey, None);
     }
 
     #[test]
@@ -347,12 +418,15 @@ mod tests {
             name: "Work".to_string(),
             icon: None,
             working_directory: None,
+            hotkey: None,
         }];
         let profiles = parse_profiles(Some(profile_files));
         assert_eq!(profiles.len(), 2);
-        // Default should be first
+        // Default should be first with default hotkey
         assert_eq!(profiles[0].name, DEFAULT_PROFILE_NAME);
+        assert_eq!(profiles[0].hotkey, Some(DEFAULT_PROFILE_HOTKEY.to_string()));
         assert_eq!(profiles[1].name, "Work");
+        assert_eq!(profiles[1].hotkey, None);
     }
 
     #[test]
@@ -362,17 +436,21 @@ mod tests {
                 name: "Work".to_string(),
                 icon: None,
                 working_directory: None,
+                hotkey: None,
             },
             ProfileFile {
                 name: "Default".to_string(),
                 icon: None,
                 working_directory: None,
+                hotkey: Some("Ctrl+Shift+F2".to_string()),
             },
         ];
         let profiles = parse_profiles(Some(profile_files));
         assert_eq!(profiles.len(), 2);
         // Default should be moved to first
         assert_eq!(profiles[0].name, DEFAULT_PROFILE_NAME);
+        // User-defined hotkey should be preserved
+        assert_eq!(profiles[0].hotkey, Some("Ctrl+Shift+F2".to_string()));
         assert_eq!(profiles[1].name, "Work");
     }
 
@@ -402,5 +480,76 @@ mod tests {
         let config = Config::default();
         assert!(config.get_profile(0).is_some());
         assert!(config.get_profile(100).is_none());
+    }
+
+    #[test]
+    fn test_default_tab_hotkeys() {
+        let hotkeys = default_tab_hotkeys();
+        assert_eq!(hotkeys.len(), 10);
+        assert_eq!(hotkeys.get("Ctrl+Shift+1"), Some(&1));
+        assert_eq!(hotkeys.get("Ctrl+Shift+9"), Some(&9));
+        assert_eq!(hotkeys.get("Ctrl+Shift+0"), Some(&10));
+    }
+
+    #[test]
+    fn test_hotkey_config_default() {
+        let config = HotkeyConfig::default();
+        assert_eq!(config.tab.len(), 10);
+        assert_eq!(config.tab.get("Ctrl+Shift+1"), Some(&1));
+    }
+
+    #[test]
+    fn test_parse_hotkey_config_none() {
+        let config = parse_hotkey_config(None);
+        // Should get defaults
+        assert_eq!(config.tab.len(), 10);
+    }
+
+    #[test]
+    fn test_parse_hotkey_config_empty() {
+        let config = parse_hotkey_config(Some(HotkeyConfigFile {
+            tab: Some(HashMap::new()),
+        }));
+        // Empty tab map disables tab hotkeys
+        assert_eq!(config.tab.len(), 0);
+    }
+
+    #[test]
+    fn test_parse_hotkey_config_custom() {
+        let mut tab = HashMap::new();
+        tab.insert("Alt+1".to_string(), 1);
+        tab.insert("Alt+2".to_string(), 2);
+        let config = parse_hotkey_config(Some(HotkeyConfigFile { tab: Some(tab) }));
+        assert_eq!(config.tab.len(), 2);
+        assert_eq!(config.tab.get("Alt+1"), Some(&1));
+        assert_eq!(config.tab.get("Alt+2"), Some(&2));
+    }
+
+    #[test]
+    fn test_profile_with_hotkey() {
+        let profile_files = vec![ProfileFile {
+            name: "Work".to_string(),
+            icon: None,
+            working_directory: None,
+            hotkey: Some("Ctrl+Shift+F2".to_string()),
+        }];
+        let profiles = parse_profiles(Some(profile_files));
+        assert_eq!(profiles.len(), 2);
+        // Generated Default at index 0
+        assert_eq!(profiles[0].hotkey, Some(DEFAULT_PROFILE_HOTKEY.to_string()));
+        // User profile at index 1
+        assert_eq!(profiles[1].hotkey, Some("Ctrl+Shift+F2".to_string()));
+    }
+
+    #[test]
+    fn test_config_default_has_hotkeys() {
+        let config = Config::default();
+        // Default config should have default tab hotkeys
+        assert_eq!(config.hotkeys.tab.len(), 10);
+        // Default profile should have default hotkey
+        assert_eq!(
+            config.profiles[0].hotkey,
+            Some(DEFAULT_PROFILE_HOTKEY.to_string())
+        );
     }
 }

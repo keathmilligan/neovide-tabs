@@ -347,6 +347,14 @@ impl TabManager {
         self.tabs.get(index).map(|tab| tab.profile_index)
     }
 
+    /// Find the first tab with the given profile index.
+    /// Returns the tab index if found, None otherwise.
+    pub fn find_tab_by_profile_index(&self, profile_index: usize) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.profile_index == profile_index)
+    }
+
     /// Get the icon filename for a tab
     pub fn get_tab_icon(&self, index: usize) -> Option<&str> {
         self.tabs.get(index).map(|tab| tab.profile_icon.as_str())

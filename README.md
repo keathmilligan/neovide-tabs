@@ -12,9 +12,10 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 
 - **Tab Support**: Create, close, and switch between multiple Neovide instances using tabs
 - **Tab Reordering**: Drag tabs to rearrange their order
-- **Profile Support**: Configure multiple profiles with custom working directories and icons
+- **Global Hotkeys**: System-wide keyboard shortcuts to switch tabs or open profiles from any application
+- **Profile Support**: Configure multiple profiles with custom working directories, icons, and hotkeys
 - **Custom Icons**: Per-profile PNG icons loaded from `~/.config/neovide-tabs/icons/`
-- **Configurable**: JSON configuration file for background color and profiles
+- **Configurable**: JSON configuration file for background color, profiles, and hotkeys
 - **Custom Titlebar**: Native custom titlebar with Windows 11 rounded corners
 - **Window Embedding**: Embeds Neovide with `--frame none` for seamless integration
 - **Automatic Sizing**: Neovide windows fill the wrapper's client area and resize dynamically
@@ -100,6 +101,22 @@ The application will:
 
 When the last tab is closed, the application exits.
 
+### Global Hotkeys
+
+neovide-tabs registers system-wide hotkeys that work regardless of which application is focused:
+
+**Default Tab Hotkeys:**
+- `Ctrl+Shift+1` through `Ctrl+Shift+9`: Activate tabs 1-9
+- `Ctrl+Shift+0`: Activate tab 10
+
+**Default Profile Hotkeys:**
+- `Ctrl+Shift+F1`: Open or activate the Default profile
+- Additional profiles can have custom hotkeys defined in configuration
+
+Profile hotkeys will:
+- Activate an existing tab with that profile if one exists
+- Create a new tab with that profile if none exists
+
 ### Configuration
 
 Configuration is stored at `~/.config/neovide-tabs/config.json`:
@@ -111,14 +128,23 @@ Configuration is stored at `~/.config/neovide-tabs/config.json`:
     {
       "name": "Default",
       "icon": "neovide.png",
-      "working_directory": "~"
+      "working_directory": "~",
+      "hotkey": "Ctrl+Shift+F1"
     },
     {
       "name": "Work",
       "icon": "work.png",
-      "working_directory": "~/projects/work"
+      "working_directory": "~/projects/work",
+      "hotkey": "Ctrl+Shift+F2"
     }
-  ]
+  ],
+  "hotkeys": {
+    "tab": {
+      "1": "Ctrl+Shift+1",
+      "2": "Ctrl+Shift+2",
+      "3": "Ctrl+Shift+3"
+    }
+  }
 }
 ```
 
@@ -129,6 +155,13 @@ Configuration is stored at `~/.config/neovide-tabs/config.json`:
   - `name`: Display name shown on tabs
   - `icon`: PNG filename (loaded from `~/.config/neovide-tabs/icons/`)
   - `working_directory`: Starting directory for Neovide (supports `~` expansion)
+  - `hotkey`: (optional) Global hotkey to open/activate this profile (e.g., `"Ctrl+Shift+F1"`)
+- `hotkeys`: (optional) Hotkey configuration:
+  - `tab`: Map of tab number to hotkey string (e.g., `{"1": "Ctrl+Shift+1"}`)
+
+**Hotkey format:** `Modifier+Modifier+Key` where modifiers are `Ctrl`, `Alt`, `Shift`, `Win` and keys are `A-Z`, `0-9`, or `F1-F12`.
+
+To disable default tab hotkeys, set `"hotkeys": {"tab": {}}`.
 
 Place PNG icons in `~/.config/neovide-tabs/icons/`. Icons are automatically scaled to 16x16 pixels.
 
@@ -149,7 +182,7 @@ neovide-tabs help
 
 ## Architecture
 
-The application consists of six main modules:
+The application consists of seven main modules:
 
 - **main.rs**: Entry point with CLI argument handling and startup validation
 - **window.rs**: Win32 window management, message loop, custom titlebar, tab bar rendering, profile dropdown popup, and state handling
@@ -157,12 +190,12 @@ The application consists of six main modules:
 - **process.rs**: Neovide process spawning, window discovery, and positioning
 - **config.rs**: Configuration loading and parsing from JSON, profile management
 - **icons.rs**: Icon loading (PNG), caching, and Win32 bitmap conversion
+- **hotkeys.rs**: Global hotkey registration, parsing, and Win32 hotkey integration
 
 ## Limitations
 
 - **Windows only**: Currently only supports Windows (uses Win32 API directly)
 - **No tab persistence**: Tab sessions are not saved across application restarts
-- **No keyboard shortcuts**: Tab navigation currently requires mouse interaction
 
 ## Roadmap
 
@@ -177,7 +210,7 @@ The application consists of six main modules:
 - [x] Tab reordering via drag-and-drop
 - [x] Configurable tab behavior (custom working directories via profiles)
 - [x] Profile support with custom icons
-- [ ] Keyboard shortcuts for tab navigation
+- [x] Global hotkeys for tab navigation and profile activation
 - [ ] Persistent tab sessions
 - [ ] Cross-platform support (Linux, macOS)
 
@@ -203,6 +236,6 @@ Contributions are welcome! Please read the development guidelines in `AGENTS.md`
 
 ## Project Status
 
-**Current Version:** 0.3.0 (Profile Support)
+**Current Version:** 0.4.0 (Global Hotkeys)
 
-The application now supports multiple tabs with profile-based configuration. Each profile can have a custom name, icon, and working directory. Users can create tabs from any profile via a dropdown menu, close tabs gracefully (respecting unsaved changes), switch between tabs, and reorder them via drag-and-drop. The next milestone is adding keyboard shortcuts for tab navigation.
+The application now supports global hotkeys for tab navigation and profile activation. System-wide keyboard shortcuts (Ctrl+Shift+1-9,0) switch between tabs, and profile-specific hotkeys open or activate tabs with that profile. Each profile can have a custom name, icon, working directory, and hotkey. Users can create tabs from any profile via a dropdown menu, close tabs gracefully (respecting unsaved changes), switch between tabs, and reorder them via drag-and-drop.

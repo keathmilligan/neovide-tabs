@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::config::{Config, Profile};
+use crate::hotkeys;
 use crate::icons::{ICON_SIZE, create_window_icons, get_icon_bitmap};
 use crate::tabs::{DragState, TabManager};
 
@@ -150,6 +151,8 @@ struct WindowState {
     tracking_mouse: bool,
     dropdown_state: DropdownState,
     dropdown_hwnd: Option<HWND>,
+    /// IDs of registered global hotkeys (for cleanup on exit)
+    registered_hotkeys: Vec<i32>,
 }
 
 /// State for the dropdown popup window
@@ -1534,6 +1537,17 @@ unsafe extern "system" fn window_proc(
                 }
             }
 
+            // Register global hotkeys
+            let mut registered_hotkeys = Vec::new();
+
+            // Register tab hotkeys
+            let tab_hotkey_ids = hotkeys::register_tab_hotkeys(hwnd, &config.hotkeys.tab);
+            registered_hotkeys.extend(tab_hotkey_ids);
+
+            // Register profile hotkeys
+            let profile_hotkey_ids = hotkeys::register_profile_hotkeys(hwnd, &config.profiles);
+            registered_hotkeys.extend(profile_hotkey_ids);
+
             let state = Box::new(WindowState {
                 tab_manager,
                 config,
@@ -1544,6 +1558,7 @@ unsafe extern "system" fn window_proc(
                 tracking_mouse: false,
                 dropdown_state: DropdownState::Closed,
                 dropdown_hwnd: None,
+                registered_hotkeys,
             });
             let state_ptr = Box::into_raw(state);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -1998,7 +2013,93 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_DESTROY => {
+            // Unregister all global hotkeys
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &*state_ptr;
+                hotkeys::unregister_all_hotkeys(hwnd, &state.registered_hotkeys);
+            }
             PostQuitMessage(0);
+            LRESULT(0)
+        }
+
+        WM_HOTKEY => {
+            let hotkey_id = wparam.0 as i32;
+
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+
+                // Bring window to foreground first (restore if minimized)
+                bring_window_to_foreground(hwnd);
+
+                if hotkeys::is_tab_hotkey(hotkey_id) {
+                    // Tab activation hotkey (1-10)
+                    if let Some(tab_index) = hotkeys::tab_index_from_hotkey_id(hotkey_id) {
+                        if tab_index < state.tab_manager.count() {
+                            // Tab exists - select it
+                            if state.tab_manager.select_tab(tab_index) {
+                                state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
+                                InvalidateRect(hwnd, None, false);
+                            } else {
+                                // Already selected - just ensure foreground
+                                state
+                                    .tab_manager
+                                    .activate_and_foreground_selected(hwnd, TITLEBAR_HEIGHT);
+                            }
+                        }
+                        // If tab doesn't exist, do nothing (no error)
+                    }
+                } else if hotkeys::is_profile_hotkey(hotkey_id) {
+                    // Profile activation hotkey (101+)
+                    if let Some(profile_index) = hotkeys::profile_index_from_hotkey_id(hotkey_id) {
+                        // Check if we already have a tab with this profile
+                        if let Some(existing_tab) =
+                            state.tab_manager.find_tab_by_profile_index(profile_index)
+                        {
+                            // Activate existing tab
+                            if state.tab_manager.select_tab(existing_tab) {
+                                state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
+                                InvalidateRect(hwnd, None, false);
+                            } else {
+                                state
+                                    .tab_manager
+                                    .activate_and_foreground_selected(hwnd, TITLEBAR_HEIGHT);
+                            }
+                        } else if let Some(profile) = state.config.get_profile(profile_index) {
+                            // Create new tab with this profile
+                            if let Ok(rect) = get_content_rect(hwnd) {
+                                let width = (rect.right - rect.left) as u32;
+                                let height = (rect.bottom - rect.top) as u32;
+                                let profile = profile.clone();
+
+                                match state.tab_manager.create_tab(
+                                    width,
+                                    height,
+                                    hwnd,
+                                    &profile,
+                                    profile_index,
+                                ) {
+                                    Ok(_) => {
+                                        // Hide other tabs
+                                        for (i, tab) in state.tab_manager.iter() {
+                                            if i != state.tab_manager.selected_index() {
+                                                tab.process.hide();
+                                            }
+                                        }
+                                        InvalidateRect(hwnd, None, false);
+                                    }
+                                    Err(e) => {
+                                        let error_msg = format!("Failed to create new tab: {}", e);
+                                        show_error(&error_msg, "Error: Failed to Create Tab");
+                                    }
+                                }
+                            }
+                        }
+                        // If profile doesn't exist, do nothing (no error)
+                    }
+                }
+            }
             LRESULT(0)
         }
 
@@ -2289,6 +2390,18 @@ unsafe extern "system" fn window_proc(
         }
 
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Bring the wrapper window to the foreground, restoring it if minimized
+fn bring_window_to_foreground(hwnd: HWND) {
+    unsafe {
+        // Restore if minimized
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        // Bring to foreground
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 
