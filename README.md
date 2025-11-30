@@ -1,8 +1,10 @@
+![neovide-tabs](neovide-tabs-pix.png)
+
 # neovide-tabs
 
-A lightweight wrapper application for [Neovide](https://neovide.dev) that embeds Neovide instances within a host window (Windows only).
+A lightweight Windows application that provides a tabbed interface to manage multiple [Neovide](https://neovide.dev) instances.
 
-![neovide-tabs screenshot](screenshot.png)
+![neovide-tabs screenshot](screenshot.png?v=1)
 
 ## Overview
 
