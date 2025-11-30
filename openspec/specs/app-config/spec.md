@@ -101,18 +101,24 @@ The system SHALL allow users to define tab profiles in the configuration file, w
 - **AND** no error SHALL be displayed to the user
 
 ### Requirement: Default Profile Generation
-The system SHALL ensure a profile named "Default" always exists by generating one at runtime if not defined in the configuration.
+The system SHALL generate an internal "Default" profile only when no profiles are defined in the configuration.
 
-#### Scenario: No Default profile in configuration
+#### Scenario: No profiles field in configuration
 - **WHEN** the application starts
-- **AND** no profile with the name "Default" exists in the configuration
-- **THEN** a Default profile SHALL be generated with name "Default", icon "neovide-tabs.png", and working directory set to the user's home directory
-- **AND** the generated Default profile SHALL be inserted at the beginning of the profiles list
+- **AND** the config file exists but has no `profiles` field
+- **THEN** an internal Default profile SHALL be generated with name "Default", icon "neovide.png", and working directory set to the user's home directory
+- **AND** the generated Default profile SHALL have `Ctrl+Shift+F1` as its default hotkey
 
-#### Scenario: User-defined Default profile exists
+#### Scenario: Empty profiles array in configuration
 - **WHEN** the application starts
-- **AND** a profile named "Default" is defined in the configuration
-- **THEN** the user-defined Default profile SHALL be used without modification
+- **AND** the config file contains an empty `profiles` array
+- **THEN** an internal Default profile SHALL be generated with name "Default", icon "neovide.png", and working directory set to the user's home directory
+
+#### Scenario: User-defined profiles exist
+- **WHEN** the application starts
+- **AND** the config file contains a non-empty `profiles` array
+- **THEN** no internal Default profile SHALL be generated
+- **AND** the profiles list SHALL contain only the user-defined profiles
 
 ### Requirement: Profile Icon Loading
 The system SHALL load profile icons using the following resolution: the default icon is loaded from the data directory, and user-defined icons are loaded from full paths.
@@ -281,7 +287,7 @@ The system SHALL generate a default configuration file with documented defaults 
 - **AND** the system SHALL then generate the default config file
 
 ### Requirement: Default Config File Content
-The generated default configuration file SHALL document all available options with their default values as comments.
+The generated default configuration file SHALL document all available options with their default values, and SHALL include a working "Neovim" profile that is not commented out.
 
 #### Scenario: Background color default
 - **WHEN** the default config file is generated
@@ -293,13 +299,20 @@ The generated default configuration file SHALL document all available options wi
 - **THEN** the file SHALL contain a commented `hotkeys` object
 - **AND** the `hotkeys.tab` object SHALL document the default tab hotkeys (`Ctrl+Shift+1` through `Ctrl+Shift+0` for tabs 1-10)
 
-#### Scenario: Profile examples
+#### Scenario: Default Neovim profile
 - **WHEN** the default config file is generated
-- **THEN** the file SHALL contain a commented `profiles` array
-- **AND** the array SHALL include example profiles demonstrating:
+- **THEN** the file SHALL contain an uncommented `profiles` array
+- **AND** the first profile SHALL have name "Neovim"
+- **AND** the first profile SHALL use the default icon
+- **AND** the first profile SHALL use the user's home directory as working directory
+- **AND** the profile SHALL include `Ctrl+Shift+F1` as its default hotkey
+
+#### Scenario: Profile examples in comments
+- **WHEN** the default config file is generated
+- **THEN** the file SHALL include commented example profiles demonstrating:
   - A profile with custom `name`, `icon`, `working_directory`, and `hotkey` fields
   - A profile with minimal configuration (name only)
-- **AND** each example profile SHALL include inline comments explaining the purpose of each field
+- **AND** each example SHALL include inline comments explaining the purpose of each field
 
 ### Requirement: JSONC File Support
 The system SHALL support both `.jsonc` and `.json` file extensions for configuration, with `.jsonc` as the preferred format.
@@ -334,4 +347,17 @@ The system SHALL parse JSONC format (JSON with Comments) for both `.jsonc` and `
 - **WHEN** all comment lines are removed from the generated file
 - **THEN** the remaining content SHALL be valid JSON
 - **AND** uncommenting any individual option SHALL result in valid JSON
+
+### Requirement: Initial Tab Profile Selection
+The system SHALL use the first profile in the configuration for the initial tab when the application starts.
+
+#### Scenario: Profiles defined in config
+- **WHEN** the application starts
+- **AND** the config file contains one or more profiles
+- **THEN** the initial tab SHALL be created using the first profile in the list
+
+#### Scenario: No profiles in config (fallback)
+- **WHEN** the application starts
+- **AND** no profiles are defined in the configuration
+- **THEN** the initial tab SHALL be created using the internally generated Default profile
 

@@ -26,7 +26,7 @@ pub const DEFAULT_PROFILE_NAME: &str = "Default";
 pub const DEFAULT_PROFILE_HOTKEY: &str = "Ctrl+Shift+F1";
 
 /// Default configuration file template (JSONC format with comments)
-/// All values are commented out to show defaults without overriding user's empty config.
+/// Includes an uncommented "Neovim" profile for out-of-box functionality.
 const DEFAULT_CONFIG_TEMPLATE: &str = r##"// neovide-tabs configuration file
 // Uncomment and modify options below to customize behavior.
 // See https://github.com/your-repo/neovide-tabs for documentation.
@@ -57,26 +57,33 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r##"// neovide-tabs configuration file
 
     // Profile definitions for tabs
     // Each profile can specify a name, icon, working directory, and hotkey
-    // A "Default" profile is always available; if not defined here, one is generated
-    // "profiles": [
-    //     {
-    //         // Profile name (required) - displayed in the tab
-    //         "name": "Work",
-    //         // Icon file path (optional) - full path to a PNG file
-    //         // Defaults to neovide.png in the data directory
-    //         "icon": "C:/path/to/icon.png",
-    //         // Working directory (optional) - where Neovide starts
-    //         // Supports ~ for home directory. Defaults to home directory
-    //         "working_directory": "~/projects/work",
-    //         // Global hotkey (optional) - opens or activates a tab with this profile
-    //         // Format: Modifier+Key (e.g., Ctrl+Shift+F2, Alt+Shift+W)
-    //         "hotkey": "Ctrl+Shift+F2"
-    //     },
-    //     {
-    //         // Minimal profile example - only name is required
-    //         "name": "Personal"
-    //     }
-    // ]
+    // The first profile is used for the initial tab when the application starts
+    "profiles": [
+        {
+            // Default profile - used for the initial tab
+            "name": "Neovim",
+            // Uses default icon (neovide.png) and home directory
+            "hotkey": "Ctrl+Shift+F1"
+        }
+        // Example: Additional profile with all options
+        // {
+        //     // Profile name (required) - displayed in the tab
+        //     "name": "Work",
+        //     // Icon file path (optional) - full path to a PNG file
+        //     // Defaults to neovide.png in the data directory
+        //     "icon": "C:/path/to/icon.png",
+        //     // Working directory (optional) - where Neovide starts
+        //     // Supports ~ for home directory. Defaults to home directory
+        //     "working_directory": "~/projects/work",
+        //     // Global hotkey (optional) - opens or activates a tab with this profile
+        //     // Format: Modifier+Key (e.g., Ctrl+Shift+F2, Alt+Shift+W)
+        //     "hotkey": "Ctrl+Shift+F2"
+        // },
+        // {
+        //     // Minimal profile example - only name is required
+        //     "name": "Personal"
+        // }
+    ]
 }
 "##;
 
@@ -196,12 +203,20 @@ impl Config {
 
         let path = match find_config_file() {
             Some(p) => p,
-            None => return Self::default(),
+            None => {
+                eprintln!("Config: No config file found, using defaults");
+                return Self::default();
+            }
         };
+
+        eprintln!("Config: Loading from {}", path.display());
 
         let contents = match fs::read_to_string(&path) {
             Ok(c) => c,
-            Err(_) => return Self::default(),
+            Err(e) => {
+                eprintln!("Config: Failed to read config file: {}", e);
+                return Self::default();
+            }
         };
 
         // Strip JSONC comments before parsing
@@ -209,8 +224,17 @@ impl Config {
 
         let config_file: ConfigFile = match serde_json::from_str(&json_content) {
             Ok(c) => c,
-            Err(_) => return Self::default(),
+            Err(e) => {
+                eprintln!("Config: Failed to parse JSON: {}", e);
+                eprintln!("Config: JSON content after stripping comments:\n{}", json_content);
+                return Self::default();
+            }
         };
+
+        eprintln!(
+            "Config: Parsed successfully - profiles: {:?}",
+            config_file.profiles.as_ref().map(|p| p.len())
+        );
 
         Self::from_config_file(config_file)
     }
@@ -233,7 +257,9 @@ impl Config {
         }
     }
 
-    /// Get the default profile (first profile in the list, which is always "Default")
+    /// Get the first profile in the list, used for the initial tab.
+    /// When profiles are defined in config, returns the first user-defined profile.
+    /// When no profiles are defined, returns the internal "Default" profile.
     pub fn default_profile(&self) -> &Profile {
         // profiles is guaranteed to have at least one element
         &self.profiles[0]
@@ -245,40 +271,49 @@ impl Config {
     }
 }
 
-/// Parse profiles from config file, ensuring Default profile exists
+/// Parse profiles from config file.
+/// If no profiles are defined (None or empty), falls back to the internal Default profile.
+/// If profiles are defined, uses them as-is without inserting a Default profile.
 fn parse_profiles(profiles_opt: Option<Vec<ProfileFile>>) -> Vec<Profile> {
     let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
-    let mut profiles: Vec<Profile> = match profiles_opt {
-        Some(profile_files) if !profile_files.is_empty() => profile_files
-            .into_iter()
-            .map(|pf| {
-                let working_directory = pf
-                    .working_directory
-                    .map(|wd| resolve_path(&wd, &home_dir))
-                    .unwrap_or_else(|| home_dir.clone());
+    eprintln!(
+        "Config: parse_profiles called with {:?} profiles",
+        profiles_opt.as_ref().map(|p| p.len())
+    );
 
-                Profile {
-                    name: pf.name,
-                    icon: pf.icon.unwrap_or_else(|| DEFAULT_ICON.to_string()),
-                    working_directory,
-                    hotkey: pf.hotkey,
-                }
-            })
-            .collect(),
-        _ => Vec::new(),
+    let profiles: Vec<Profile> = match profiles_opt {
+        Some(profile_files) if !profile_files.is_empty() => {
+            eprintln!("Config: Processing {} user-defined profiles", profile_files.len());
+            profile_files
+                .into_iter()
+                .map(|pf| {
+                    eprintln!("Config: Processing profile '{}'", pf.name);
+                    let working_directory = pf
+                        .working_directory
+                        .map(|wd| resolve_working_directory(&wd, &home_dir))
+                        .unwrap_or_else(|| home_dir.clone());
+                    let icon = resolve_icon_path(pf.icon, &home_dir);
+
+                    Profile {
+                        name: pf.name,
+                        icon,
+                        working_directory,
+                        hotkey: pf.hotkey,
+                    }
+                })
+            .collect()
+        }
+        // No profiles defined - use internal Default profile as fallback
+        _ => {
+            eprintln!("Config: No profiles defined, using internal Default profile");
+            vec![Profile::default_profile()]
+        }
     };
 
-    // Ensure a "Default" profile exists at the beginning
-    let has_default = profiles.iter().any(|p| p.name == DEFAULT_PROFILE_NAME);
-    if !has_default {
-        profiles.insert(0, Profile::default_profile());
-    } else if let Some(pos) = profiles.iter().position(|p| p.name == DEFAULT_PROFILE_NAME)
-        && pos != 0
-    {
-        // Move Default to the front if it exists elsewhere
-        let default = profiles.remove(pos);
-        profiles.insert(0, default);
+    eprintln!("Config: Final profile count: {}", profiles.len());
+    for (i, p) in profiles.iter().enumerate() {
+        eprintln!("Config:   [{}] name='{}', hotkey={:?}", i, p.name, p.hotkey);
     }
 
     profiles
@@ -297,8 +332,8 @@ fn parse_hotkey_config(config_opt: Option<HotkeyConfigFile>) -> HotkeyConfig {
     }
 }
 
-/// Resolve a path string, expanding ~ to home directory
-fn resolve_path(path_str: &str, home_dir: &Path) -> PathBuf {
+/// Expand ~ to home directory in a path string
+fn expand_tilde(path_str: &str, home_dir: &Path) -> PathBuf {
     if path_str.starts_with('~') {
         let rest = path_str.strip_prefix('~').unwrap_or("");
         let rest = rest
@@ -311,17 +346,36 @@ fn resolve_path(path_str: &str, home_dir: &Path) -> PathBuf {
             home_dir.join(rest)
         }
     } else {
-        let path = PathBuf::from(path_str);
-        // Validate the directory exists, fall back to home if not
-        if path.is_dir() {
-            path
-        } else {
-            eprintln!(
-                "Warning: Working directory '{}' does not exist, using home directory",
-                path_str
-            );
-            home_dir.to_path_buf()
+        PathBuf::from(path_str)
+    }
+}
+
+/// Resolve a working directory path string, expanding ~ to home directory.
+/// Falls back to home directory if the path doesn't exist.
+fn resolve_working_directory(path_str: &str, home_dir: &Path) -> PathBuf {
+    let path = expand_tilde(path_str, home_dir);
+    // Validate the directory exists, fall back to home if not
+    if path.is_dir() {
+        path
+    } else {
+        eprintln!(
+            "Warning: Working directory '{}' does not exist, using home directory",
+            path_str
+        );
+        home_dir.to_path_buf()
+    }
+}
+
+/// Resolve an icon path string, expanding ~ to home directory.
+/// Returns the expanded path as a string, or the default icon if not specified.
+fn resolve_icon_path(icon_opt: Option<String>, home_dir: &Path) -> String {
+    match icon_opt {
+        Some(icon_str) if icon_str.starts_with('~') => {
+            let expanded = expand_tilde(&icon_str, home_dir);
+            expanded.to_string_lossy().to_string()
         }
+        Some(icon_str) => icon_str,
+        None => DEFAULT_ICON.to_string(),
     }
 }
 
@@ -621,7 +675,8 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_profiles_without_default() {
+    fn test_parse_profiles_user_defined() {
+        // User-defined profiles are used as-is without inserting Default
         let profile_files = vec![ProfileFile {
             name: "Work".to_string(),
             icon: None,
@@ -629,16 +684,15 @@ mod tests {
             hotkey: None,
         }];
         let profiles = parse_profiles(Some(profile_files));
-        assert_eq!(profiles.len(), 2);
-        // Default should be first with default hotkey
-        assert_eq!(profiles[0].name, DEFAULT_PROFILE_NAME);
-        assert_eq!(profiles[0].hotkey, Some(DEFAULT_PROFILE_HOTKEY.to_string()));
-        assert_eq!(profiles[1].name, "Work");
-        assert_eq!(profiles[1].hotkey, None);
+        assert_eq!(profiles.len(), 1);
+        // First profile is the user-defined one
+        assert_eq!(profiles[0].name, "Work");
+        assert_eq!(profiles[0].hotkey, None);
     }
 
     #[test]
-    fn test_parse_profiles_moves_default_to_front() {
+    fn test_parse_profiles_preserves_order() {
+        // User-defined profiles maintain their order
         let profile_files = vec![
             ProfileFile {
                 name: "Work".to_string(),
@@ -647,7 +701,7 @@ mod tests {
                 hotkey: None,
             },
             ProfileFile {
-                name: "Default".to_string(),
+                name: "Personal".to_string(),
                 icon: None,
                 working_directory: None,
                 hotkey: Some("Ctrl+Shift+F2".to_string()),
@@ -655,25 +709,55 @@ mod tests {
         ];
         let profiles = parse_profiles(Some(profile_files));
         assert_eq!(profiles.len(), 2);
-        // Default should be moved to first
-        assert_eq!(profiles[0].name, DEFAULT_PROFILE_NAME);
-        // User-defined hotkey should be preserved
-        assert_eq!(profiles[0].hotkey, Some("Ctrl+Shift+F2".to_string()));
-        assert_eq!(profiles[1].name, "Work");
+        // Order is preserved - first defined profile is first
+        assert_eq!(profiles[0].name, "Work");
+        assert_eq!(profiles[0].hotkey, None);
+        assert_eq!(profiles[1].name, "Personal");
+        assert_eq!(profiles[1].hotkey, Some("Ctrl+Shift+F2".to_string()));
     }
 
     #[test]
-    fn test_resolve_path_home() {
+    fn test_expand_tilde_home() {
         let home = PathBuf::from("/home/test");
-        let resolved = resolve_path("~", &home);
+        let resolved = expand_tilde("~", &home);
         assert_eq!(resolved, home);
     }
 
     #[test]
-    fn test_resolve_path_home_subdir() {
+    fn test_expand_tilde_home_subdir() {
         let home = PathBuf::from("/home/test");
-        let resolved = resolve_path("~/projects", &home);
+        let resolved = expand_tilde("~/projects", &home);
         assert_eq!(resolved, home.join("projects"));
+    }
+
+    #[test]
+    fn test_expand_tilde_no_tilde() {
+        let home = PathBuf::from("/home/test");
+        let resolved = expand_tilde("/absolute/path", &home);
+        assert_eq!(resolved, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_resolve_icon_path_with_tilde() {
+        let home = PathBuf::from("/home/test");
+        let icon = resolve_icon_path(Some("~/icons/my-icon.png".to_string()), &home);
+        // Use PathBuf for comparison to handle platform-specific separators
+        let expected = home.join("icons/my-icon.png");
+        assert_eq!(icon, expected.to_string_lossy());
+    }
+
+    #[test]
+    fn test_resolve_icon_path_absolute() {
+        let home = PathBuf::from("/home/test");
+        let icon = resolve_icon_path(Some("/absolute/path/icon.png".to_string()), &home);
+        assert_eq!(icon, "/absolute/path/icon.png");
+    }
+
+    #[test]
+    fn test_resolve_icon_path_default() {
+        let home = PathBuf::from("/home/test");
+        let icon = resolve_icon_path(None, &home);
+        assert_eq!(icon, DEFAULT_ICON);
     }
 
     #[test]
@@ -742,11 +826,10 @@ mod tests {
             hotkey: Some("Ctrl+Shift+F2".to_string()),
         }];
         let profiles = parse_profiles(Some(profile_files));
-        assert_eq!(profiles.len(), 2);
-        // Generated Default at index 0
-        assert_eq!(profiles[0].hotkey, Some(DEFAULT_PROFILE_HOTKEY.to_string()));
-        // User profile at index 1
-        assert_eq!(profiles[1].hotkey, Some("Ctrl+Shift+F2".to_string()));
+        assert_eq!(profiles.len(), 1);
+        // User profile with hotkey
+        assert_eq!(profiles[0].name, "Work");
+        assert_eq!(profiles[0].hotkey, Some("Ctrl+Shift+F2".to_string()));
     }
 
     #[test]
@@ -791,6 +874,9 @@ mod tests {
         assert!(content.contains("icon"));
         assert!(content.contains("working_directory"));
         assert!(content.contains("hotkey"));
+        // Should contain the uncommented "Neovim" profile
+        assert!(content.contains("\"Neovim\""));
+        assert!(content.contains("\"Ctrl+Shift+F1\""));
     }
 
     #[test]
@@ -803,20 +889,21 @@ mod tests {
     #[test]
     fn test_generate_default_config_is_valid_jsonc() {
         let content = generate_default_config();
-        // Strip all comment lines and check remaining is valid JSON
-        let stripped: String = content
-            .lines()
-            .filter(|line| !line.trim().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Strip comments using the same method as config loading
+        let stripped = strip_jsonc_comments(content);
 
-        // The stripped content should be valid JSON (just an empty object {})
+        // The stripped content should be valid JSON with profiles array
         let result: Result<serde_json::Value, _> = serde_json::from_str(&stripped);
         assert!(
             result.is_ok(),
             "Stripped JSONC should be valid JSON: {}",
             stripped
         );
+
+        // Verify it contains the Neovim profile
+        let json = result.unwrap();
+        assert!(json["profiles"].is_array());
+        assert_eq!(json["profiles"][0]["name"], "Neovim");
     }
 
     #[test]
