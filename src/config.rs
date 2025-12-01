@@ -226,7 +226,10 @@ impl Config {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("Config: Failed to parse JSON: {}", e);
-                eprintln!("Config: JSON content after stripping comments:\n{}", json_content);
+                eprintln!(
+                    "Config: JSON content after stripping comments:\n{}",
+                    json_content
+                );
                 return Self::default();
             }
         };
@@ -284,7 +287,10 @@ fn parse_profiles(profiles_opt: Option<Vec<ProfileFile>>) -> Vec<Profile> {
 
     let profiles: Vec<Profile> = match profiles_opt {
         Some(profile_files) if !profile_files.is_empty() => {
-            eprintln!("Config: Processing {} user-defined profiles", profile_files.len());
+            eprintln!(
+                "Config: Processing {} user-defined profiles",
+                profile_files.len()
+            );
             profile_files
                 .into_iter()
                 .map(|pf| {
@@ -302,7 +308,7 @@ fn parse_profiles(profiles_opt: Option<Vec<ProfileFile>>) -> Vec<Profile> {
                         hotkey: pf.hotkey,
                     }
                 })
-            .collect()
+                .collect()
         }
         // No profiles defined - use internal Default profile as fallback
         _ => {
@@ -985,6 +991,9 @@ mod tests {
         let content = generate_default_config();
         let stripped = strip_jsonc_comments(content);
         let result: Result<serde_json::Value, _> = serde_json::from_str(&stripped);
-        assert!(result.is_ok(), "Default template should parse after stripping comments");
+        assert!(
+            result.is_ok(),
+            "Default template should parse after stripping comments"
+        );
     }
 }

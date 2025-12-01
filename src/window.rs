@@ -5,16 +5,17 @@
 
 use anyhow::{Context, Result};
 use std::cell::Cell;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     BITMAP, BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
     CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect,
-    GetObjectW, GetTextMetricsW, HBITMAP, HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo,
-    MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY, STRETCH_HALFTONE, ScreenToClient, SelectObject,
-    SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, TEXTMETRICW, TRANSPARENT, TextOutW,
+    GetObjectW, GetTextExtentPoint32W, GetTextMetricsW, HBITMAP, HBRUSH, HGDIOBJ, InvalidateRect,
+    LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY, STRETCH_HALFTONE, ScreenToClient,
+    SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, TEXTMETRICW, TRANSPARENT,
+    TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -31,6 +32,7 @@ use crate::tabs::{DragState, TabManager};
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("NeovideTabsWindow");
 const DROPDOWN_CLASS_NAME: PCWSTR = w!("NeovideTabsDropdown");
+const OVERFLOW_CLASS_NAME: PCWSTR = w!("NeovideTabsOverflow");
 const WINDOW_TITLE: PCWSTR = w!("neovide-tabs");
 
 /// Title bar height in pixels
@@ -57,7 +59,7 @@ const PROCESS_POLL_INTERVAL_MS: u32 = 250;
 
 // Tab bar layout constants
 /// Width of each tab in pixels
-const TAB_WIDTH: i32 = 120;
+const TAB_WIDTH: i32 = 200;
 /// Size of the close button within a tab
 const TAB_CLOSE_SIZE: i32 = 16;
 /// Padding around the close button
@@ -66,6 +68,8 @@ const TAB_CLOSE_PADDING: i32 = 8;
 const NEW_TAB_BUTTON_WIDTH: i32 = 32;
 /// Width of the profile dropdown button (caret)
 const DROPDOWN_BUTTON_WIDTH: i32 = 20;
+/// Width of the overflow tabs button (accommodates icon + "+N" text when selected tab is in overflow)
+const OVERFLOW_BUTTON_WIDTH: i32 = 48;
 /// Left margin before the first tab
 const TAB_BAR_LEFT_MARGIN: i32 = 8;
 /// Vertical padding for tabs within the titlebar
@@ -107,6 +111,8 @@ pub enum TabHitResult {
     ProfileDropdown,
     /// Hit a profile in the dropdown menu (index)
     DropdownItem(usize),
+    /// Hit the overflow tabs dropdown button
+    OverflowButton,
     /// Hit the caption/drag area
     Caption,
     /// Hit nothing in the tab bar
@@ -129,6 +135,8 @@ enum HoveredTab {
     /// Hovering over dropdown menu item (index) - unused, popup handles hover
     #[allow(dead_code)]
     DropdownItem(usize),
+    /// Hovering over overflow tabs button
+    OverflowButton,
 }
 
 /// State of the profile dropdown menu
@@ -151,6 +159,8 @@ struct WindowState {
     tracking_mouse: bool,
     dropdown_state: DropdownState,
     dropdown_hwnd: Option<HWND>,
+    /// Handle to the overflow tabs popup window (if open)
+    overflow_hwnd: Option<HWND>,
     /// IDs of registered global hotkeys (for cleanup on exit)
     registered_hotkeys: Vec<i32>,
 }
@@ -159,6 +169,26 @@ struct WindowState {
 struct DropdownPopupState {
     parent_hwnd: HWND,
     profiles: Vec<Profile>,
+    hovered_item: Option<usize>,
+    background_color: u32,
+}
+
+/// Info about an overflow tab for the popup
+struct OverflowTabInfo {
+    /// Original index of this tab in the tab manager
+    index: usize,
+    /// Tab label
+    label: String,
+    /// Icon filename
+    icon: String,
+    /// Whether this tab is selected
+    is_selected: bool,
+}
+
+/// State for the overflow tabs popup window
+struct OverflowPopupState {
+    parent_hwnd: HWND,
+    tabs: Vec<OverflowTabInfo>,
     hovered_item: Option<usize>,
     background_color: u32,
 }
@@ -233,6 +263,26 @@ pub fn register_window_class(config: Config) -> Result<()> {
         let dropdown_atom = RegisterClassW(&dropdown_wc);
         if dropdown_atom == 0 {
             anyhow::bail!("Failed to register dropdown window class");
+        }
+
+        // Register overflow tabs popup window class
+        let overflow_brush = CreateSolidBrush(COLORREF(colorref));
+        let overflow_wc = WNDCLASSW {
+            style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
+            lpfnWndProc: Some(overflow_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance.into(),
+            hIcon: Default::default(),
+            hCursor: LoadCursorW(None, IDC_ARROW).ok().unwrap_or_default(),
+            hbrBackground: HBRUSH(overflow_brush.0),
+            lpszMenuName: PCWSTR::null(),
+            lpszClassName: OVERFLOW_CLASS_NAME,
+        };
+
+        let overflow_atom = RegisterClassW(&overflow_wc);
+        if overflow_atom == 0 {
+            anyhow::bail!("Failed to register overflow window class");
         }
     }
 
@@ -392,9 +442,18 @@ fn get_tab_close_rect(tab_rect: &RECT) -> RECT {
 }
 
 /// Get the rectangle for the new tab (+) button
-fn get_new_tab_button_rect(tab_count: usize, client_width: i32) -> RECT {
+/// When has_overflow is true, it's positioned after the overflow button
+fn get_new_tab_button_rect_ex(
+    visible_tab_count: usize,
+    has_overflow: bool,
+    client_width: i32,
+) -> RECT {
     let _ = client_width; // Reserved for future dynamic sizing
-    let left = TAB_BAR_LEFT_MARGIN + (tab_count as i32 * TAB_WIDTH);
+    let left = if has_overflow {
+        TAB_BAR_LEFT_MARGIN + (visible_tab_count as i32 * TAB_WIDTH) + OVERFLOW_BUTTON_WIDTH
+    } else {
+        TAB_BAR_LEFT_MARGIN + (visible_tab_count as i32 * TAB_WIDTH)
+    };
     RECT {
         left,
         top: TAB_VERTICAL_PADDING,
@@ -403,15 +462,30 @@ fn get_new_tab_button_rect(tab_count: usize, client_width: i32) -> RECT {
     }
 }
 
+/// Get the rectangle for the new tab (+) button (legacy, assumes no overflow)
+#[allow(dead_code)]
+fn get_new_tab_button_rect(tab_count: usize, client_width: i32) -> RECT {
+    get_new_tab_button_rect_ex(tab_count, false, client_width)
+}
+
 /// Get the rectangle for the profile dropdown button (caret)
-fn get_dropdown_button_rect(tab_count: usize, client_width: i32) -> RECT {
-    let new_tab_rect = get_new_tab_button_rect(tab_count, client_width);
+fn get_dropdown_button_rect_ex(
+    visible_tab_count: usize,
+    has_overflow: bool,
+    client_width: i32,
+) -> RECT {
+    let new_tab_rect = get_new_tab_button_rect_ex(visible_tab_count, has_overflow, client_width);
     RECT {
         left: new_tab_rect.right,
         top: TAB_VERTICAL_PADDING,
         right: new_tab_rect.right + DROPDOWN_BUTTON_WIDTH,
         bottom: TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING,
     }
+}
+
+/// Get the rectangle for the profile dropdown button (legacy, assumes no overflow)
+fn get_dropdown_button_rect(tab_count: usize, client_width: i32) -> RECT {
+    get_dropdown_button_rect_ex(tab_count, false, client_width)
 }
 
 /// Get the rectangle for the dropdown menu (unused - popup handles its own layout)
@@ -453,6 +527,46 @@ fn get_tab_bar_max_x(client_width: i32) -> i32 {
     client_width - (BUTTON_WIDTH * 3) - 8 // Leave some padding before window buttons
 }
 
+/// Calculate how many tabs can be displayed before overflow
+/// Returns (visible_count, has_overflow)
+fn calculate_visible_tabs(tab_count: usize, client_width: i32) -> (usize, bool) {
+    if tab_count == 0 {
+        return (0, false);
+    }
+
+    let max_x = get_tab_bar_max_x(client_width);
+    // Reserve space for new tab button, dropdown button, and potentially overflow button
+    let reserved_space = NEW_TAB_BUTTON_WIDTH + DROPDOWN_BUTTON_WIDTH + OVERFLOW_BUTTON_WIDTH;
+    let available_width = max_x - TAB_BAR_LEFT_MARGIN - reserved_space;
+
+    let max_visible = (available_width / TAB_WIDTH).max(0) as usize;
+
+    if max_visible >= tab_count {
+        // All tabs fit (no overflow button needed, so we can reclaim that space)
+        let available_without_overflow =
+            max_x - TAB_BAR_LEFT_MARGIN - NEW_TAB_BUTTON_WIDTH - DROPDOWN_BUTTON_WIDTH;
+        let max_visible_no_overflow = (available_without_overflow / TAB_WIDTH).max(0) as usize;
+        if max_visible_no_overflow >= tab_count {
+            return (tab_count, false);
+        }
+    }
+
+    // Need overflow
+    (max_visible.min(tab_count), max_visible < tab_count)
+}
+
+/// Get the rectangle for the overflow button
+fn get_overflow_button_rect(visible_tab_count: usize, client_width: i32) -> RECT {
+    let _ = client_width; // Reserved for future dynamic sizing
+    let left = TAB_BAR_LEFT_MARGIN + (visible_tab_count as i32 * TAB_WIDTH);
+    RECT {
+        left,
+        top: TAB_VERTICAL_PADDING,
+        right: left + OVERFLOW_BUTTON_WIDTH,
+        bottom: TITLEBAR_HEIGHT - TAB_VERTICAL_PADDING,
+    }
+}
+
 /// Hit test in the tab bar area
 fn hit_test_tab_bar(x: i32, y: i32, tab_count: usize, client_width: i32) -> TabHitResult {
     // Must be in the titlebar height range
@@ -465,9 +579,10 @@ fn hit_test_tab_bar(x: i32, y: i32, tab_count: usize, client_width: i32) -> TabH
     }
 
     let max_x = get_tab_bar_max_x(client_width);
+    let (visible_count, has_overflow) = calculate_visible_tabs(tab_count, client_width);
 
-    // Check each tab
-    for i in 0..tab_count {
+    // Check each visible tab
+    for i in 0..visible_count {
         let tab_rect = get_tab_rect(i, client_width);
         if tab_rect.left > max_x {
             break; // Tab bar overflow
@@ -486,8 +601,16 @@ fn hit_test_tab_bar(x: i32, y: i32, tab_count: usize, client_width: i32) -> TabH
         }
     }
 
+    // Check overflow button if there are overflow tabs
+    if has_overflow {
+        let overflow_rect = get_overflow_button_rect(visible_count, client_width);
+        if x >= overflow_rect.left && x < overflow_rect.right {
+            return TabHitResult::OverflowButton;
+        }
+    }
+
     // Check new tab button
-    let new_tab_rect = get_new_tab_button_rect(tab_count, client_width);
+    let new_tab_rect = get_new_tab_button_rect_ex(visible_count, has_overflow, client_width);
     if new_tab_rect.right <= max_x {
         if x >= new_tab_rect.left && x < new_tab_rect.right {
             return TabHitResult::NewTabButton;
@@ -495,20 +618,11 @@ fn hit_test_tab_bar(x: i32, y: i32, tab_count: usize, client_width: i32) -> TabH
     }
 
     // Check dropdown button
-    let dropdown_rect = get_dropdown_button_rect(tab_count, client_width);
+    let dropdown_rect = get_dropdown_button_rect_ex(visible_count, has_overflow, client_width);
     if dropdown_rect.right <= max_x {
         if x >= dropdown_rect.left && x < dropdown_rect.right {
             return TabHitResult::ProfileDropdown;
         }
-    }
-
-    // In the tab bar area but not on any element - this is caption (draggable)
-    if x < TAB_BAR_LEFT_MARGIN
-        + (tab_count as i32 * TAB_WIDTH)
-        + NEW_TAB_BUTTON_WIDTH
-        + DROPDOWN_BUTTON_WIDTH
-    {
-        return TabHitResult::Caption;
     }
 
     TabHitResult::Caption
@@ -630,14 +744,23 @@ fn paint_tab(
         FillRect(hdc, tab_rect, tab_brush);
         DeleteObject(HGDIOBJ(tab_brush.0));
 
-        // Draw outline around tab (top, left, right - bottom is handled by tab bar line)
+        // Draw outline around tab (top, left, right)
+        // For selected tabs, extend sides down to the bottom line (TITLEBAR_HEIGHT - 1)
+        // For unselected tabs, stop at the tab rect bottom
         let outline_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
         let old_pen = SelectObject(hdc, HGDIOBJ(outline_pen.0));
 
-        MoveToEx(hdc, tab_rect.left, tab_rect.bottom, None);
+        // Selected tabs extend down to connect with the tab bar bottom line
+        let side_bottom = if is_selected {
+            TITLEBAR_HEIGHT - 1
+        } else {
+            tab_rect.bottom
+        };
+
+        MoveToEx(hdc, tab_rect.left, side_bottom, None);
         LineTo(hdc, tab_rect.left, tab_rect.top);
         LineTo(hdc, tab_rect.right - 1, tab_rect.top);
-        LineTo(hdc, tab_rect.right - 1, tab_rect.bottom);
+        LineTo(hdc, tab_rect.right - 1, side_bottom);
 
         SelectObject(hdc, old_pen);
         DeleteObject(HGDIOBJ(outline_pen.0));
@@ -683,15 +806,53 @@ fn paint_tab(
         // Center text vertically using actual text height
         let label_x = tab_rect.left + 6 + label_offset;
         let label_y = (tab_rect.top + tab_rect.bottom - text_height) / 2;
+
+        // Calculate available width for text (between icon and close button)
+        let close_rect = get_tab_close_rect(tab_rect);
+        let max_text_width = close_rect.left - label_x - 4; // 4px padding before close button
+
+        // Measure text width and truncate with ellipsis if needed
         let label_wide: Vec<u16> = label.encode_utf16().collect();
-        TextOutW(hdc, label_x, label_y, &label_wide);
+        let mut text_size = SIZE::default();
+        GetTextExtentPoint32W(hdc, &label_wide, &mut text_size);
+
+        if text_size.cx <= max_text_width {
+            // Text fits - draw normally
+            TextOutW(hdc, label_x, label_y, &label_wide);
+        } else {
+            // Text too wide - truncate with ellipsis
+            let ellipsis = "...";
+            let ellipsis_wide: Vec<u16> = ellipsis.encode_utf16().collect();
+            let mut ellipsis_size = SIZE::default();
+            GetTextExtentPoint32W(hdc, &ellipsis_wide, &mut ellipsis_size);
+
+            let available_for_text = max_text_width - ellipsis_size.cx;
+            if available_for_text > 0 {
+                // Find how many characters fit
+                let mut truncated = String::new();
+                for ch in label.chars() {
+                    let test = format!("{}{}", truncated, ch);
+                    let test_wide: Vec<u16> = test.encode_utf16().collect();
+                    let mut test_size = SIZE::default();
+                    GetTextExtentPoint32W(hdc, &test_wide, &mut test_size);
+                    if test_size.cx > available_for_text {
+                        break;
+                    }
+                    truncated.push(ch);
+                }
+                truncated.push_str(ellipsis);
+                let truncated_wide: Vec<u16> = truncated.encode_utf16().collect();
+                TextOutW(hdc, label_x, label_y, &truncated_wide);
+            } else {
+                // Not even ellipsis fits - just draw ellipsis
+                TextOutW(hdc, label_x, label_y, &ellipsis_wide);
+            }
+        }
 
         SelectObject(hdc, old_font);
         DeleteObject(HGDIOBJ(font.0));
 
-        // Draw close button
-        let close_rect = get_tab_close_rect(tab_rect);
-
+        // Draw close button (close_rect already calculated above for text truncation)
         // Close button background on hover
         if close_hovered {
             let close_hover_brush =
@@ -962,7 +1123,10 @@ fn show_dropdown_popup(parent_hwnd: HWND, state: &mut WindowState) {
             return;
         }
 
-        let dropdown_btn = get_dropdown_button_rect(state.tab_manager.count(), client_rect.right);
+        let (visible_count, has_overflow) =
+            calculate_visible_tabs(state.tab_manager.count(), client_rect.right);
+        let dropdown_btn =
+            get_dropdown_button_rect_ex(visible_count, has_overflow, client_rect.right);
 
         // Convert button position to screen coordinates
         let mut screen_pt = POINT {
@@ -1204,6 +1368,462 @@ unsafe extern "system" fn dropdown_proc(
     }
 }
 
+/// Create the overflow tabs popup window
+fn create_overflow_popup(
+    parent_hwnd: HWND,
+    tabs: Vec<OverflowTabInfo>,
+    background_color: u32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> Option<HWND> {
+    unsafe {
+        let hinstance = GetModuleHandleW(None).ok()?;
+
+        // Create popup state
+        let popup_state = Box::new(OverflowPopupState {
+            parent_hwnd,
+            tabs,
+            hovered_item: None,
+            background_color,
+        });
+
+        let hwnd = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            OVERFLOW_CLASS_NAME,
+            w!(""),
+            WS_POPUP | WS_VISIBLE,
+            x,
+            y,
+            width,
+            height,
+            None, // No parent - independent window
+            None,
+            hinstance,
+            Some(Box::into_raw(popup_state) as *const std::ffi::c_void),
+        )
+        .ok()?;
+
+        Some(hwnd)
+    }
+}
+
+/// Show the overflow tabs popup at the appropriate position
+#[allow(unused_must_use)]
+fn show_overflow_popup(parent_hwnd: HWND, state: &mut WindowState, client_width: i32) {
+    // Close any existing popup first
+    if let Some(popup_hwnd) = state.overflow_hwnd.take() {
+        unsafe {
+            DestroyWindow(popup_hwnd).ok();
+        }
+    }
+
+    let (visible_count, has_overflow) =
+        calculate_visible_tabs(state.tab_manager.count(), client_width);
+
+    if !has_overflow {
+        return;
+    }
+
+    // Collect overflow tabs info
+    let mut overflow_tabs = Vec::new();
+    let selected_index = state.tab_manager.selected_index();
+    for i in visible_count..state.tab_manager.count() {
+        overflow_tabs.push(OverflowTabInfo {
+            index: i,
+            label: state.tab_manager.get_tab_label(i),
+            icon: state
+                .tab_manager
+                .get_tab_icon(i)
+                .unwrap_or_default()
+                .to_string(),
+            is_selected: i == selected_index,
+        });
+    }
+
+    if overflow_tabs.is_empty() {
+        return;
+    }
+
+    unsafe {
+        let overflow_btn = get_overflow_button_rect(visible_count, client_width);
+
+        // Convert button position to screen coordinates
+        let mut screen_pt = POINT {
+            x: overflow_btn.left,
+            y: overflow_btn.bottom,
+        };
+        ClientToScreen(parent_hwnd, &mut screen_pt);
+
+        let tab_count = overflow_tabs.len();
+        let menu_width = TAB_WIDTH; // Same width as tabs
+        let menu_height = (tab_count as i32 * DROPDOWN_ITEM_HEIGHT) + (DROPDOWN_PADDING * 2);
+
+        // Bring Neovide back to foreground before showing popup
+        state.tab_manager.bring_selected_to_foreground();
+
+        if let Some(popup_hwnd) = create_overflow_popup(
+            parent_hwnd,
+            overflow_tabs,
+            state.background_color,
+            screen_pt.x,
+            screen_pt.y,
+            menu_width,
+            menu_height,
+        ) {
+            state.overflow_hwnd = Some(popup_hwnd);
+        }
+    }
+}
+
+/// Hide and destroy the overflow popup
+fn hide_overflow_popup(_parent_hwnd: HWND, state: &mut WindowState) {
+    if let Some(popup_hwnd) = state.overflow_hwnd.take() {
+        unsafe {
+            ReleaseCapture().ok();
+            DestroyWindow(popup_hwnd).ok();
+        }
+    }
+}
+
+/// Window procedure for the overflow tabs popup
+#[allow(unused_must_use)]
+unsafe extern "system" fn overflow_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe {
+        match msg {
+            WM_CREATE => {
+                let create_struct = lparam.0 as *const CREATESTRUCTW;
+                if !create_struct.is_null() {
+                    let state_ptr = (*create_struct).lpCreateParams as *mut OverflowPopupState;
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+                }
+                // Capture mouse to detect clicks outside the popup
+                SetCapture(hwnd);
+                LRESULT(0)
+            }
+
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverflowPopupState;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+
+                    let mut rect = RECT::default();
+                    GetClientRect(hwnd, &mut rect).ok();
+
+                    // Fill background
+                    let bg_brush =
+                        CreateSolidBrush(COLORREF(rgb_to_colorref(state.background_color)));
+                    FillRect(hdc, &rect, bg_brush);
+                    DeleteObject(HGDIOBJ(bg_brush.0));
+
+                    // Draw border
+                    let border_pen =
+                        CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
+                    let old_pen = SelectObject(hdc, HGDIOBJ(border_pen.0));
+                    MoveToEx(hdc, rect.left, rect.top, None);
+                    LineTo(hdc, rect.right - 1, rect.top);
+                    LineTo(hdc, rect.right - 1, rect.bottom - 1);
+                    LineTo(hdc, rect.left, rect.bottom - 1);
+                    LineTo(hdc, rect.left, rect.top);
+                    SelectObject(hdc, old_pen);
+                    DeleteObject(HGDIOBJ(border_pen.0));
+
+                    // Draw each overflow tab item
+                    for (i, tab_info) in state.tabs.iter().enumerate() {
+                        let item_top = DROPDOWN_PADDING + (i as i32 * DROPDOWN_ITEM_HEIGHT);
+                        let item_rect = RECT {
+                            left: DROPDOWN_PADDING,
+                            top: item_top,
+                            right: rect.right - DROPDOWN_PADDING,
+                            bottom: item_top + DROPDOWN_ITEM_HEIGHT,
+                        };
+
+                        // Hover or selected background
+                        if state.hovered_item == Some(i) || tab_info.is_selected {
+                            let bg_color = if state.hovered_item == Some(i) {
+                                TAB_HOVER_COLOR
+                            } else {
+                                TAB_UNSELECTED_COLOR
+                            };
+                            let item_brush = CreateSolidBrush(COLORREF(rgb_to_colorref(bg_color)));
+                            FillRect(hdc, &item_rect, item_brush);
+                            DeleteObject(HGDIOBJ(item_brush.0));
+                        }
+
+                        // Draw icon
+                        let icon_x = item_rect.left + 4;
+                        let icon_y = (item_rect.top + item_rect.bottom - ICON_SIZE) / 2;
+                        if let Some(hbitmap) = get_icon_bitmap(&tab_info.icon) {
+                            paint_icon(hdc, hbitmap, icon_x, icon_y, ICON_SIZE, ICON_SIZE);
+                        }
+
+                        // Draw text
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, COLORREF(0x00FFFFFF));
+
+                        let mut lf = LOGFONTW::default();
+                        lf.lfHeight = -12;
+                        lf.lfWeight = if tab_info.is_selected { 700 } else { 400 };
+                        let font_name = "Segoe UI";
+                        for (j, c) in font_name.encode_utf16().enumerate() {
+                            if j < 32 {
+                                lf.lfFaceName[j] = c;
+                            }
+                        }
+                        let font = CreateFontIndirectW(&lf);
+                        let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+
+                        // Get actual text metrics for proper vertical centering
+                        let mut tm = TEXTMETRICW::default();
+                        GetTextMetricsW(hdc, &mut tm);
+                        let text_height = tm.tmHeight;
+
+                        // Text position after icon, vertically centered
+                        let text_x = item_rect.left + ICON_SIZE + 8;
+                        let text_y = (item_rect.top + item_rect.bottom - text_height) / 2;
+
+                        // Calculate available width for text and truncate if needed
+                        let max_text_width = item_rect.right - text_x - 4;
+                        let label_wide: Vec<u16> = tab_info.label.encode_utf16().collect();
+                        let mut text_size = SIZE::default();
+                        GetTextExtentPoint32W(hdc, &label_wide, &mut text_size);
+
+                        if text_size.cx <= max_text_width {
+                            TextOutW(hdc, text_x, text_y, &label_wide);
+                        } else {
+                            // Truncate with ellipsis
+                            let ellipsis = "...";
+                            let ellipsis_wide: Vec<u16> = ellipsis.encode_utf16().collect();
+                            let mut ellipsis_size = SIZE::default();
+                            GetTextExtentPoint32W(hdc, &ellipsis_wide, &mut ellipsis_size);
+
+                            let available_for_text = max_text_width - ellipsis_size.cx;
+                            if available_for_text > 0 {
+                                let mut truncated = String::new();
+                                for ch in tab_info.label.chars() {
+                                    let test = format!("{}{}", truncated, ch);
+                                    let test_wide: Vec<u16> = test.encode_utf16().collect();
+                                    let mut test_size = SIZE::default();
+                                    GetTextExtentPoint32W(hdc, &test_wide, &mut test_size);
+                                    if test_size.cx > available_for_text {
+                                        break;
+                                    }
+                                    truncated.push(ch);
+                                }
+                                truncated.push_str(ellipsis);
+                                let truncated_wide: Vec<u16> = truncated.encode_utf16().collect();
+                                TextOutW(hdc, text_x, text_y, &truncated_wide);
+                            } else {
+                                TextOutW(hdc, text_x, text_y, &ellipsis_wide);
+                            }
+                        }
+
+                        SelectObject(hdc, old_font);
+                        DeleteObject(HGDIOBJ(font.0));
+                    }
+                }
+
+                EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+
+            WM_MOUSEMOVE => {
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverflowPopupState;
+                if !state_ptr.is_null() {
+                    let state = &mut *state_ptr;
+
+                    // Calculate which item is hovered
+                    let item_index = (y - DROPDOWN_PADDING) / DROPDOWN_ITEM_HEIGHT;
+                    let new_hovered = if item_index >= 0 && (item_index as usize) < state.tabs.len()
+                    {
+                        Some(item_index as usize)
+                    } else {
+                        None
+                    };
+
+                    if state.hovered_item != new_hovered {
+                        state.hovered_item = new_hovered;
+                        InvalidateRect(hwnd, None, false);
+                    }
+                }
+                LRESULT(0)
+            }
+
+            WM_LBUTTONDOWN => {
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverflowPopupState;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+
+                    // Check if click is inside the popup
+                    let mut rect = RECT::default();
+                    GetClientRect(hwnd, &mut rect).ok();
+
+                    if x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom {
+                        // Click inside - check which item
+                        let item_index = (y - DROPDOWN_PADDING) / DROPDOWN_ITEM_HEIGHT;
+                        if item_index >= 0 && (item_index as usize) < state.tabs.len() {
+                            // Send custom message to parent with original tab index
+                            let tab_index = state.tabs[item_index as usize].index;
+                            PostMessageW(
+                                state.parent_hwnd,
+                                WM_APP + 2, // New message for overflow tab selection
+                                WPARAM(tab_index),
+                                LPARAM(0),
+                            )
+                            .ok();
+                        }
+                    } else {
+                        // Click outside - just notify parent to close
+                        PostMessageW(state.parent_hwnd, WM_APP + 3, WPARAM(0), LPARAM(0)).ok();
+                    }
+                    // Release capture and close popup
+                    ReleaseCapture().ok();
+                    DestroyWindow(hwnd).ok();
+                }
+                LRESULT(0)
+            }
+
+            WM_CAPTURECHANGED => {
+                // We lost capture - close the popup
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverflowPopupState;
+                if !state_ptr.is_null() {
+                    let state = &*state_ptr;
+                    PostMessageW(state.parent_hwnd, WM_APP + 3, WPARAM(0), LPARAM(0)).ok();
+                }
+                DestroyWindow(hwnd).ok();
+                LRESULT(0)
+            }
+
+            WM_DESTROY => {
+                let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverflowPopupState;
+                if !state_ptr.is_null() {
+                    // Free the state
+                    let _ = Box::from_raw(state_ptr);
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                }
+                LRESULT(0)
+            }
+
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// Paint the overflow button (shows "+N" count indicator) styled like a tab
+/// When has_selected_overflow is true, also displays the selected tab's icon
+#[allow(unused_must_use)]
+fn paint_overflow_button(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rect: &RECT,
+    overflow_count: usize,
+    is_hovered: bool,
+    has_selected_overflow: bool,
+    selected_icon: Option<&str>,
+) {
+    unsafe {
+        // Determine background color - acts like a "selected" tab if it contains the selected tab
+        let bg_color = if is_hovered {
+            TAB_HOVER_COLOR
+        } else if has_selected_overflow {
+            // When selected tab is in overflow, use unselected color (like other non-active tabs)
+            TAB_UNSELECTED_COLOR
+        } else {
+            TAB_UNSELECTED_COLOR
+        };
+
+        let bg_brush = CreateSolidBrush(COLORREF(rgb_to_colorref(bg_color)));
+        FillRect(hdc, rect, bg_brush);
+        DeleteObject(HGDIOBJ(bg_brush.0));
+
+        // Draw outline around overflow button (top, left, right - like a tab)
+        let outline_pen = CreatePen(PS_SOLID, 1, COLORREF(rgb_to_colorref(TAB_OUTLINE_COLOR)));
+        let old_pen = SelectObject(hdc, HGDIOBJ(outline_pen.0));
+
+        // If selected tab is in overflow, extend sides down to connect with bottom line
+        let side_bottom = if has_selected_overflow {
+            TITLEBAR_HEIGHT - 1
+        } else {
+            rect.bottom
+        };
+
+        MoveToEx(hdc, rect.left, side_bottom, None);
+        LineTo(hdc, rect.left, rect.top);
+        LineTo(hdc, rect.right - 1, rect.top);
+        LineTo(hdc, rect.right - 1, side_bottom);
+
+        SelectObject(hdc, old_pen);
+        DeleteObject(HGDIOBJ(outline_pen.0));
+
+        // Draw selected tab's icon if selected is in overflow
+        let text_offset = if has_selected_overflow {
+            if let Some(icon_filename) = selected_icon {
+                if let Some(hbitmap) = get_icon_bitmap(icon_filename) {
+                    let icon_x = rect.left + 4;
+                    let icon_y = (rect.top + rect.bottom - ICON_SIZE) / 2;
+                    paint_icon(hdc, hbitmap, icon_x, icon_y, ICON_SIZE, ICON_SIZE);
+                    ICON_SIZE + 2 // Icon width + small padding
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        // Draw the count text
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, COLORREF(0x00FFFFFF));
+
+        let mut lf = LOGFONTW::default();
+        lf.lfHeight = -11;
+        lf.lfWeight = 400;
+        let font_name = "Segoe UI";
+        for (i, c) in font_name.encode_utf16().enumerate() {
+            if i < 32 {
+                lf.lfFaceName[i] = c;
+            }
+        }
+        let font = CreateFontIndirectW(&lf);
+        let old_font = SelectObject(hdc, HGDIOBJ(font.0));
+
+        // Show count like "+3" for overflow tabs
+        let text = format!("+{}", overflow_count);
+        let text_wide: Vec<u16> = text.encode_utf16().collect();
+
+        let mut tm = TEXTMETRICW::default();
+        GetTextMetricsW(hdc, &mut tm);
+        let text_height = tm.tmHeight;
+
+        let mut text_size = SIZE::default();
+        GetTextExtentPoint32W(hdc, &text_wide, &mut text_size);
+
+        // Center text in remaining space (after icon if present)
+        let text_area_left = rect.left + text_offset;
+        let text_x = (text_area_left + rect.right - text_size.cx) / 2;
+        let text_y = (rect.top + rect.bottom - text_height) / 2;
+        TextOutW(hdc, text_x, text_y, &text_wide);
+
+        SelectObject(hdc, old_font);
+        DeleteObject(HGDIOBJ(font.0));
+    }
+}
+
 /// Paint the tab bar (all tabs and new tab button)
 #[allow(unused_must_use)]
 fn paint_tab_bar(
@@ -1216,9 +1836,15 @@ fn paint_tab_bar(
     let max_x = get_tab_bar_max_x(client_width);
     let selected_index = tab_manager.selected_index();
     let drag_state = &tab_manager.drag_state;
+    let (visible_count, has_overflow) = calculate_visible_tabs(tab_manager.count(), client_width);
 
-    // First pass: paint all non-dragged tabs in their normal positions
+    // First pass: paint all visible non-dragged tabs
     for (i, _tab) in tab_manager.iter() {
+        // Skip overflow tabs
+        if i >= visible_count {
+            break;
+        }
+
         // Skip the dragged tab - we'll paint it last so it appears on top
         if let Some(drag) = drag_state {
             if drag.is_active() && i == drag.tab_index {
@@ -1228,7 +1854,7 @@ fn paint_tab_bar(
 
         let tab_rect = get_tab_rect(i, client_width);
         if tab_rect.left > max_x {
-            break; // Overflow
+            break;
         }
 
         let is_selected = i == selected_index;
@@ -1249,15 +1875,36 @@ fn paint_tab_bar(
         );
     }
 
+    // Paint overflow button if there are overflow tabs
+    if has_overflow {
+        let overflow_rect = get_overflow_button_rect(visible_count, client_width);
+        let overflow_count = tab_manager.count() - visible_count;
+        let is_hovered = matches!(hovered_tab, HoveredTab::OverflowButton);
+        let has_selected_overflow = selected_index >= visible_count;
+        let selected_icon = if has_selected_overflow {
+            tab_manager.get_tab_icon(selected_index)
+        } else {
+            None
+        };
+        paint_overflow_button(
+            hdc,
+            &overflow_rect,
+            overflow_count,
+            is_hovered,
+            has_selected_overflow,
+            selected_icon,
+        );
+    }
+
     // Paint new tab button
-    let new_tab_rect = get_new_tab_button_rect(tab_manager.count(), client_width);
+    let new_tab_rect = get_new_tab_button_rect_ex(visible_count, has_overflow, client_width);
     if new_tab_rect.right <= max_x {
         let is_hovered = matches!(hovered_tab, HoveredTab::NewTabButton);
         paint_new_tab_button(hdc, &new_tab_rect, is_hovered);
     }
 
     // Paint dropdown button
-    let dropdown_rect = get_dropdown_button_rect(tab_manager.count(), client_width);
+    let dropdown_rect = get_dropdown_button_rect_ex(visible_count, has_overflow, client_width);
     if dropdown_rect.right <= max_x {
         let is_hovered = matches!(hovered_tab, HoveredTab::ProfileDropdown);
         paint_dropdown_button(hdc, &dropdown_rect, is_hovered);
@@ -1273,9 +1920,10 @@ fn paint_tab_bar(
             let drag_index = drag.tab_index;
             let visual_x = drag.get_visual_x();
 
-            // Clamp the visual position to stay within the tab bar bounds
+            // Clamp the visual position to stay within the visible tab bar bounds
             let min_x = TAB_BAR_LEFT_MARGIN;
-            let max_tab_x = TAB_BAR_LEFT_MARGIN + ((tab_manager.count() - 1) as i32 * TAB_WIDTH);
+            let max_tab_x =
+                TAB_BAR_LEFT_MARGIN + ((visible_count.saturating_sub(1)) as i32 * TAB_WIDTH);
             let clamped_x = visual_x.clamp(min_x, max_tab_x.max(min_x));
 
             let drag_rect = RECT {
@@ -1304,7 +1952,7 @@ fn paint_tab_bar(
     }
 }
 
-/// Paint the bottom line of the tab bar with a gap for the selected tab
+/// Paint the bottom line of the tab bar with a gap for the selected tab (or overflow button)
 #[allow(unused_must_use)]
 fn paint_tab_bar_bottom_line(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -1320,19 +1968,30 @@ fn paint_tab_bar_bottom_line(
         let line_start_x = 0;
         let line_end_x = client_width;
 
-        // Get the selected tab rect to create a gap
+        // Determine where the gap should be
         let selected_index = tab_manager.selected_index();
-        let selected_rect = get_tab_rect(selected_index, client_width);
+        let (visible_count, has_overflow) =
+            calculate_visible_tabs(tab_manager.count(), client_width);
 
-        // Draw line from left edge to start of selected tab
-        if selected_rect.left > line_start_x {
+        // If selected tab is in overflow, gap is at the overflow button
+        // Otherwise, gap is at the selected tab
+        let gap_rect = if has_overflow && selected_index >= visible_count {
+            // Selected tab is in overflow - gap at overflow button
+            get_overflow_button_rect(visible_count, client_width)
+        } else {
+            // Selected tab is visible - gap at the selected tab
+            get_tab_rect(selected_index, client_width)
+        };
+
+        // Draw line from left edge to start of gap (connects with left side)
+        if gap_rect.left > line_start_x {
             MoveToEx(hdc, line_start_x, line_y, None);
-            LineTo(hdc, selected_rect.left, line_y);
+            LineTo(hdc, gap_rect.left + 1, line_y);
         }
 
-        // Draw line from end of selected tab to right edge
-        if selected_rect.right < line_end_x {
-            MoveToEx(hdc, selected_rect.right - 1, line_y, None);
+        // Draw line from end of gap to right edge (connects with right side)
+        if gap_rect.right < line_end_x {
+            MoveToEx(hdc, gap_rect.right - 1, line_y, None);
             LineTo(hdc, line_end_x, line_y);
         }
 
@@ -1558,6 +2217,7 @@ unsafe extern "system" fn window_proc(
                 tracking_mouse: false,
                 dropdown_state: DropdownState::Closed,
                 dropdown_hwnd: None,
+                overflow_hwnd: None,
                 registered_hotkeys,
             });
             let state_ptr = Box::into_raw(state);
@@ -1678,7 +2338,8 @@ unsafe extern "system" fn window_proc(
                                         | TabHitResult::TabClose(_)
                                         | TabHitResult::NewTabButton
                                         | TabHitResult::ProfileDropdown
-                                        | TabHitResult::DropdownItem(_) => {
+                                        | TabHitResult::DropdownItem(_)
+                                        | TabHitResult::OverflowButton => {
                                             // These are handled as client area clicks
                                             return LRESULT(HTCLIENT as isize);
                                         }
@@ -2118,8 +2779,9 @@ unsafe extern "system" fn window_proc(
 
                     match tab_hit {
                         TabHitResult::Tab(index) => {
-                            // Close dropdown if open
+                            // Close popups if open
                             hide_dropdown_popup(hwnd, state);
+                            hide_overflow_popup(hwnd, state);
                             // Start potential drag - get the tab's initial position
                             let tab_rect = get_tab_rect(index, client_width);
                             state.tab_manager.drag_state = Some(DragState {
@@ -2132,8 +2794,9 @@ unsafe extern "system" fn window_proc(
                             SetCapture(hwnd);
                         }
                         TabHitResult::TabClose(index) => {
-                            // Close dropdown if open
+                            // Close popups if open
                             hide_dropdown_popup(hwnd, state);
+                            hide_overflow_popup(hwnd, state);
                             // Request graceful close - sends WM_CLOSE to Neovide window
                             // Process polling will detect when process exits and remove the tab
                             // If window not ready, falls back to forceful close
@@ -2152,8 +2815,9 @@ unsafe extern "system" fn window_proc(
                             // If graceful, do nothing - process polling handles tab removal
                         }
                         TabHitResult::NewTabButton => {
-                            // Close dropdown if open
+                            // Close popups if open
                             hide_dropdown_popup(hwnd, state);
+                            hide_overflow_popup(hwnd, state);
                             // Create new tab with default profile
                             if let Ok(rect) = get_content_rect(hwnd) {
                                 let width = (rect.right - rect.left) as u32;
@@ -2186,6 +2850,8 @@ unsafe extern "system" fn window_proc(
                             }
                         }
                         TabHitResult::ProfileDropdown => {
+                            // Close overflow popup if open
+                            hide_overflow_popup(hwnd, state);
                             // Toggle dropdown popup
                             if state.dropdown_state == DropdownState::Open {
                                 hide_dropdown_popup(hwnd, state);
@@ -2194,10 +2860,25 @@ unsafe extern "system" fn window_proc(
                             }
                             InvalidateRect(hwnd, None, false);
                         }
+                        TabHitResult::OverflowButton => {
+                            // Close dropdown popup if open
+                            hide_dropdown_popup(hwnd, state);
+                            // Toggle overflow popup
+                            if state.overflow_hwnd.is_some() {
+                                hide_overflow_popup(hwnd, state);
+                            } else {
+                                show_overflow_popup(hwnd, state, client_width);
+                            }
+                            InvalidateRect(hwnd, None, false);
+                        }
                         _ => {
-                            // Close dropdown popup if open and clicking elsewhere
+                            // Close popups if open and clicking elsewhere
                             if state.dropdown_state == DropdownState::Open {
                                 hide_dropdown_popup(hwnd, state);
+                                InvalidateRect(hwnd, None, false);
+                            }
+                            if state.overflow_hwnd.is_some() {
+                                hide_overflow_popup(hwnd, state);
                                 InvalidateRect(hwnd, None, false);
                             }
                         }
@@ -2305,6 +2986,7 @@ unsafe extern "system" fn window_proc(
                             TabHitResult::TabClose(i) => HoveredTab::TabClose(i),
                             TabHitResult::NewTabButton => HoveredTab::NewTabButton,
                             TabHitResult::ProfileDropdown => HoveredTab::ProfileDropdown,
+                            TabHitResult::OverflowButton => HoveredTab::OverflowButton,
                             _ => HoveredTab::None,
                         };
 
@@ -2384,6 +3066,35 @@ unsafe extern "system" fn window_proc(
                 let state = &mut *state_ptr;
                 state.dropdown_hwnd = None; // Popup already destroyed itself
                 state.dropdown_state = DropdownState::Closed;
+                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+
+        // WM_APP + 2: Overflow tab selected (wparam = tab index)
+        msg if msg == WM_APP + 2 => {
+            let tab_index = wparam.0;
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.overflow_hwnd = None; // Popup already destroyed itself
+
+                // Select the tab
+                if state.tab_manager.select_tab(tab_index) {
+                    // Hide all other tabs and activate the selected one
+                    state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
+                }
+                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+
+        // WM_APP + 3: Overflow popup closed (lost focus or click outside)
+        msg if msg == WM_APP + 3 => {
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.overflow_hwnd = None; // Popup already destroyed itself
                 InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
