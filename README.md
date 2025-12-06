@@ -214,7 +214,6 @@ The application consists of seven main modules:
 - [x] Profile support with custom icons
 - [x] Global hotkeys for tab navigation and profile activation
 - [ ] Persistent tab sessions
-- [ ] Cross-platform support (Linux, macOS)
 
 ## Contributing
 
