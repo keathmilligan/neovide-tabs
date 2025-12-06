@@ -304,33 +304,15 @@ struct WindowListContext {
     windows: Vec<WindowInfo>,
 }
 
-/// Callback for EnumWindows to find Neovide window by exact title and class match
+/// Callback for EnumWindows to find Neovide window by class name and process ID
+/// Note: We don't check the title because Neovide's title changes based on the current file/directory
 unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
     unsafe {
         let context = &mut *(lparam.0 as *mut NeovideSearchContext);
 
         let visible = IsWindowVisible(hwnd).as_bool();
 
-        // Get window title
-        let title = {
-            let len = GetWindowTextLengthW(hwnd);
-            if len == 0 {
-                return BOOL(1); // Continue - no title
-            }
-            let mut buffer: Vec<u16> = vec![0; (len + 1) as usize];
-            let copied = GetWindowTextW(hwnd, &mut buffer);
-            if copied == 0 {
-                return BOOL(1); // Continue
-            }
-            String::from_utf16_lossy(&buffer[..copied as usize])
-        };
-
-        // Check for exact title match: "Neovide"
-        if title != "Neovide" {
-            return BOOL(1); // Continue enumeration
-        }
-
-        // Get class name
+        // Get class name first (this is the reliable identifier)
         let class_name = {
             let mut buffer: Vec<u16> = vec![0; 256];
             let len = GetClassNameW(hwnd, &mut buffer);
@@ -340,7 +322,7 @@ unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPAR
             String::from_utf16_lossy(&buffer[..len as usize])
         };
 
-        // Check for exact class match: "Window Class"
+        // Check for exact class match: "Window Class" (Neovide's window class)
         if class_name != "Window Class" {
             return BOOL(1); // Continue enumeration
         }
@@ -356,6 +338,22 @@ unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPAR
         {
             return BOOL(1); // Continue enumeration - wrong process
         }
+
+        // Get window title (for logging purposes only)
+        let title = {
+            let len = GetWindowTextLengthW(hwnd);
+            if len == 0 {
+                String::new()
+            } else {
+                let mut buffer: Vec<u16> = vec![0; (len + 1) as usize];
+                let copied = GetWindowTextW(hwnd, &mut buffer);
+                if copied == 0 {
+                    String::new()
+                } else {
+                    String::from_utf16_lossy(&buffer[..copied as usize])
+                }
+            }
+        };
 
         // Get window rect
         let mut rect = RECT::default();
@@ -375,7 +373,7 @@ unsafe extern "system" fn enum_windows_neovide_callback(hwnd: HWND, lparam: LPAR
     }
 }
 
-/// Find a Neovide window by exact title "Neovide" and class "Window Class"
+/// Find a Neovide window by class name "Window Class"
 #[allow(dead_code)]
 fn find_neovide_window() -> Option<WindowInfo> {
     let mut context = NeovideSearchContext {
