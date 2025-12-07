@@ -9,8 +9,8 @@ use std::time::Duration;
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetClassNameW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_TOP, IsWindowVisible, MB_ICONERROR, MB_OK, MessageBoxW,
-    PostMessageW, SW_HIDE, SW_SHOW, SWP_NOZORDER, SetWindowPos, ShowWindow, WM_CLOSE,
+    GetWindowThreadProcessId, HWND_TOP, IsWindow, IsWindowVisible, MB_ICONERROR, MB_OK,
+    MessageBoxW, PostMessageW, SW_HIDE, SW_SHOW, SWP_NOZORDER, SetWindowPos, ShowWindow, WM_CLOSE,
 };
 use windows::core::PCWSTR;
 
@@ -154,14 +154,33 @@ impl NeovideProcess {
     }
 
     /// Terminate the Neovide process forcefully using kill()
+    /// If the process has already exited, this is a no-op.
     pub fn terminate(&mut self) -> Result<()> {
         if let Some(mut child) = self.child.lock().unwrap().take() {
-            child
-                .kill()
-                .context("Failed to terminate Neovide process")?;
-            child.wait().context("Failed to wait for Neovide process")?;
+            // First check if the process has already exited
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    // Already exited, nothing to do
+                    Ok(())
+                }
+                Ok(None) => {
+                    // Still running, kill it
+                    child
+                        .kill()
+                        .context("Failed to terminate Neovide process")?;
+                    child.wait().context("Failed to wait for Neovide process")?;
+                    Ok(())
+                }
+                Err(_) => {
+                    // Error checking status, try to kill anyway but ignore errors
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    Ok(())
+                }
+            }
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// Request graceful close by sending WM_CLOSE to the Neovide window.
@@ -174,6 +193,10 @@ impl NeovideProcess {
         if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
             let neovide_hwnd = HWND(hwnd_raw as *mut _);
             unsafe {
+                // Check if the window is still valid
+                if !IsWindow(neovide_hwnd).as_bool() {
+                    return false;
+                }
                 // PostMessageW returns Ok(()) on success
                 PostMessageW(neovide_hwnd, WM_CLOSE, None, None).is_ok()
             }
@@ -184,13 +207,26 @@ impl NeovideProcess {
 
     /// Check if the Neovide process is still running.
     /// Returns true if the process is still running, false if it has exited or was never started.
+    /// When the process is detected as exited, this method reaps it (consumes the exit status)
+    /// and clears the child handle to prevent issues with subsequent operations.
     pub fn is_running(&self) -> bool {
-        if let Some(child) = self.child.lock().unwrap().as_mut() {
+        let mut child_guard = self.child.lock().unwrap();
+        if let Some(child) = child_guard.as_mut() {
             // try_wait() returns Ok(Some(status)) if exited, Ok(None) if still running
             match child.try_wait() {
-                Ok(Some(_status)) => false, // Process has exited
-                Ok(None) => true,           // Process is still running
-                Err(_) => false,            // Error checking status, assume not running
+                Ok(Some(_status)) => {
+                    // Process has exited - take ownership and drop to fully reap it
+                    // This prevents issues with terminate() trying to wait on an
+                    // already-reaped process
+                    let _ = child_guard.take();
+                    false
+                }
+                Ok(None) => true,
+                Err(_) => {
+                    // Error checking status - take ownership and drop to clean up
+                    let _ = child_guard.take();
+                    false
+                }
             }
         } else {
             false // No child process (already terminated or never started)

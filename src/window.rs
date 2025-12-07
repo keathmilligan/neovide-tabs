@@ -2579,13 +2579,13 @@ unsafe extern "system" fn window_proc(
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
+                    let mut should_close = false;
+                    let mut needs_repaint = false;
 
                     // Find all tabs whose processes have exited
                     let exited_indices = state.tab_manager.find_exited_tabs();
 
                     if !exited_indices.is_empty() {
-                        let mut should_close = false;
-
                         // Remove exited tabs (indices are in reverse order for safe removal)
                         for index in exited_indices {
                             if state.tab_manager.remove_exited_tab(index) {
@@ -2593,17 +2593,25 @@ unsafe extern "system" fn window_proc(
                                 should_close = true;
                                 break;
                             }
+                            needs_repaint = true;
                         }
 
-                        if should_close {
-                            // Last tab's process exited - close the application
-                            KillTimer(hwnd, PROCESS_POLL_TIMER_ID).ok();
-                            PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
-                        } else {
-                            // Activate the newly selected tab and repaint
+                        // If there are more tabs pending close, continue the sequence
+                        // This activates the next tab and sends WM_CLOSE to it
+                        if !should_close && state.tab_manager.has_pending_close() {
                             state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
-                            InvalidateRect(hwnd, None, false);
+                            state.tab_manager.continue_close_sequence();
                         }
+                    }
+
+                    if should_close {
+                        // Last tab's process exited - close the application
+                        KillTimer(hwnd, PROCESS_POLL_TIMER_ID).ok();
+                        PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+                    } else if needs_repaint {
+                        // Activate the newly selected tab and repaint
+                        state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
+                        InvalidateRect(hwnd, None, false);
                     }
                 }
             }

@@ -1,10 +1,13 @@
 #![cfg(target_os = "windows")]
 
 use anyhow::Result;
+use std::time::Instant;
 use windows::Win32::Foundation::HWND;
 
 use crate::config::Profile;
 use crate::process::NeovideProcess;
+
+
 
 /// Represents a single tab with its associated Neovide process
 pub struct Tab {
@@ -22,6 +25,8 @@ pub struct Tab {
     pub working_directory: std::path::PathBuf,
     /// Profile index in the config (for reference)
     pub profile_index: usize,
+    /// Timestamp when graceful close was requested (for timeout tracking)
+    pub close_requested_at: Option<Instant>,
 }
 
 /// State for tab drag-and-drop reordering
@@ -134,6 +139,7 @@ impl TabManager {
             profile_icon: profile.icon.clone(),
             working_directory: profile.working_directory.clone(),
             profile_index,
+            close_requested_at: None,
         };
         self.next_id += 1;
 
@@ -162,6 +168,7 @@ impl TabManager {
             profile_icon: crate::config::DEFAULT_ICON.to_string(),
             working_directory: dirs::home_dir().unwrap_or_default(),
             profile_index: 0,
+            close_requested_at: None,
         };
         self.next_id += 1;
 
@@ -302,7 +309,10 @@ impl TabManager {
 
         // Try to send WM_CLOSE to the Neovide window
         if self.tabs[index].process.request_close() {
-            // Message sent successfully - tab remains until process polling detects exit
+            // Message sent successfully - record timestamp and wait for process to exit
+            if self.tabs[index].close_requested_at.is_none() {
+                self.tabs[index].close_requested_at = Some(Instant::now());
+            }
             true
         } else {
             // Window not ready - fall back to forceful close
@@ -314,22 +324,64 @@ impl TabManager {
     /// Request graceful close for all tabs by sending WM_CLOSE to each Neovide window.
     /// For tabs where window is not ready, forcefully terminates them.
     /// Does not remove tabs - process polling will handle removal as processes exit.
+    ///
+    /// Important: We only send WM_CLOSE to the currently selected (visible) tab.
+    /// Hidden windows may not process WM_CLOSE properly. The polling mechanism
+    /// will handle closing subsequent tabs one at a time as each one exits.
     pub fn request_close_all(&mut self) {
-        // Collect indices of tabs that need forceful termination
-        let mut force_close_indices = Vec::new();
+        if self.tabs.is_empty() {
+            return;
+        }
 
-        for (i, tab) in self.tabs.iter().enumerate() {
-            if !tab.process.request_close() {
-                // Window not ready - mark for forceful termination
-                force_close_indices.push(i);
+        let now = Instant::now();
+
+        // Only request close for the currently selected (visible) tab
+        // Hidden tabs don't process WM_CLOSE reliably
+        let selected = self.selected_index;
+        if selected < self.tabs.len() {
+            let tab = &mut self.tabs[selected];
+            if tab.process.request_close() {
+                if tab.close_requested_at.is_none() {
+                    tab.close_requested_at = Some(now);
+                }
+            } else {
+                // Window not ready - forcefully close it
+                self.close_tab(selected);
             }
         }
 
-        // Forcefully close tabs without ready windows (in reverse order for safe removal)
-        force_close_indices.reverse();
-        for index in force_close_indices {
-            self.close_tab(index);
+        // Mark all other tabs as pending close (but don't send WM_CLOSE yet)
+        // They will be closed one at a time by the polling mechanism
+        for (i, tab) in self.tabs.iter_mut().enumerate() {
+            if i != self.selected_index && tab.close_requested_at.is_none() {
+                tab.close_requested_at = Some(now);
+            }
         }
+    }
+
+    /// Check if any tabs are pending close (close was requested but not yet sent WM_CLOSE)
+    pub fn has_pending_close(&self) -> bool {
+        self.tabs.iter().any(|tab| tab.close_requested_at.is_some())
+    }
+
+    /// Request close for the currently selected tab if it has a pending close.
+    /// Called after a tab is removed to continue the close sequence.
+    /// Returns true if a close was requested.
+    pub fn continue_close_sequence(&mut self) -> bool {
+        if self.tabs.is_empty() {
+            return false;
+        }
+
+        let selected = self.selected_index;
+        if selected < self.tabs.len() {
+            let tab = &mut self.tabs[selected];
+            if tab.close_requested_at.is_some() {
+                // Show the window first so it can process WM_CLOSE
+                tab.process.show();
+                return tab.process.request_close();
+            }
+        }
+        false
     }
 
     /// Get the label for a tab (profile name)
