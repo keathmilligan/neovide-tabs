@@ -27,8 +27,9 @@ use windows::core::{PCWSTR, w};
 
 use crate::config::{Config, Profile};
 use crate::hotkeys;
-use crate::icons::{ICON_SIZE, create_window_icons, get_icon_bitmap};
+use crate::icons::{ICON_SIZE, clear_icon_cache, create_window_icons, get_icon_bitmap};
 use crate::tabs::{DragState, TabManager};
+use crate::watcher::{ConfigWatcher, WM_CONFIG_RELOAD};
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("NeovideTabsWindow");
 const DROPDOWN_CLASS_NAME: PCWSTR = w!("NeovideTabsDropdown");
@@ -163,6 +164,9 @@ struct WindowState {
     overflow_hwnd: Option<HWND>,
     /// IDs of registered global hotkeys (for cleanup on exit)
     registered_hotkeys: Vec<i32>,
+    /// Handle to the config file watcher (for hot-reload)
+    #[allow(dead_code)]
+    config_watcher: Option<ConfigWatcher>,
 }
 
 /// State for the dropdown popup window
@@ -2307,6 +2311,12 @@ unsafe extern "system" fn window_proc(
             let profile_hotkey_ids = hotkeys::register_profile_hotkeys(hwnd, &config.profiles);
             registered_hotkeys.extend(profile_hotkey_ids);
 
+            // Start the config file watcher for hot-reload
+            let config_watcher = ConfigWatcher::start(hwnd);
+            if config_watcher.is_none() {
+                eprintln!("Warning: Failed to start config file watcher");
+            }
+
             let state = Box::new(WindowState {
                 tab_manager,
                 config,
@@ -2319,6 +2329,7 @@ unsafe extern "system" fn window_proc(
                 dropdown_hwnd: None,
                 overflow_hwnd: None,
                 registered_hotkeys,
+                config_watcher,
             });
             let state_ptr = Box::into_raw(state);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
@@ -3237,6 +3248,50 @@ unsafe extern "system" fn window_proc(
                 }
                 // If graceful, do nothing - process polling handles tab removal
                 InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+
+        // WM_CONFIG_RELOAD: Config file changed - reload and apply new settings
+        msg if msg == WM_CONFIG_RELOAD => {
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+
+                // Try to reload the config
+                if let Some(new_config) = Config::reload() {
+                    // Update background color if changed
+                    if new_config.background_color != state.background_color {
+                        state.background_color = new_config.background_color;
+                    }
+
+                    // Re-register hotkeys if they changed
+                    // First unregister all existing hotkeys
+                    hotkeys::unregister_all_hotkeys(hwnd, &state.registered_hotkeys);
+                    state.registered_hotkeys.clear();
+
+                    // Register new tab hotkeys
+                    let tab_hotkey_ids = hotkeys::register_tab_hotkeys(hwnd, &new_config.hotkeys.tab);
+                    state.registered_hotkeys.extend(tab_hotkey_ids);
+
+                    // Register new profile hotkeys
+                    let profile_hotkey_ids =
+                        hotkeys::register_profile_hotkeys(hwnd, &new_config.profiles);
+                    state.registered_hotkeys.extend(profile_hotkey_ids);
+
+                    // Refresh existing tabs with updated profile data (name, icon, title format)
+                    state.tab_manager.refresh_profiles(&new_config.profiles);
+
+                    // Update the config
+                    state.config = new_config;
+
+                    // Clear icon cache so new icons are loaded
+                    clear_icon_cache();
+
+                    // Repaint to reflect changes
+                    InvalidateRect(hwnd, None, false);
+                }
+                // If reload returns None (invalid config), silently keep current config
             }
             LRESULT(0)
         }

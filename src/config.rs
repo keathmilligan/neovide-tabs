@@ -289,6 +289,55 @@ impl Config {
     pub fn get_profile(&self, index: usize) -> Option<&Profile> {
         self.profiles.get(index)
     }
+
+    /// Reload configuration from disk.
+    /// Returns Some(new_config) if successfully loaded and parsed.
+    /// Returns None if loading or parsing fails (caller should keep current config).
+    pub fn reload() -> Option<Self> {
+        let path = find_config_file()?;
+
+        eprintln!("Config: Reloading from {}", path.display());
+
+        // Try to read the file, with a short retry on failure (file may be locked)
+        let contents = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Config: Failed to read config file on reload: {}", e);
+                // Retry once after a short delay
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                match fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("Config: Retry failed, keeping current config: {}", e);
+                        return None;
+                    }
+                }
+            }
+        };
+
+        // Strip JSONC comments before parsing
+        let json_content = strip_jsonc_comments(&contents);
+
+        let config_file: ConfigFile = match serde_json::from_str(&json_content) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Config: Failed to parse JSON on reload: {}", e);
+                return None;
+            }
+        };
+
+        eprintln!("Config: Reload successful");
+        Some(Self::from_config_file(config_file))
+    }
+
+    /// Find a profile by name. Returns the index and a reference to the profile.
+    #[allow(dead_code)]
+    pub fn find_profile_by_name(&self, name: &str) -> Option<(usize, &Profile)> {
+        self.profiles
+            .iter()
+            .enumerate()
+            .find(|(_, p)| p.name == name)
+    }
 }
 
 /// Parse profiles from config file.
@@ -405,7 +454,7 @@ fn resolve_icon_path(icon_opt: Option<String>, home_dir: &Path) -> String {
 }
 
 /// Get the path to the config directory: `~/.config/neovide-tabs/`
-fn config_dir_path() -> Option<PathBuf> {
+pub fn config_dir_path() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     Some(home.join(".config").join("neovide-tabs"))
 }

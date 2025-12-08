@@ -139,6 +139,16 @@ thread_local! {
     static ICON_CACHE: RefCell<IconCache> = RefCell::new(IconCache::new());
 }
 
+/// Clear the icon cache, forcing all icons to be reloaded on next access.
+/// This is used when the config file changes to pick up new icon paths.
+pub fn clear_icon_cache() {
+    ICON_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.cache.clear();
+        // Note: Keep fallback_icon and data_dir as they don't change
+    });
+}
+
 /// Ensure bundled icons are extracted to the data directory.
 /// Creates the directory if it doesn't exist.
 /// Does NOT overwrite if files already exist.

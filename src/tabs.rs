@@ -506,6 +506,37 @@ impl TabManager {
 
         false
     }
+
+    /// Refresh profile-derived fields for all tabs from the new config.
+    /// This is called after a config reload to update tab titles, icons, etc.
+    /// Tabs whose profile_index no longer exists in the config keep their current values.
+    pub fn refresh_profiles(&mut self, profiles: &[Profile]) {
+        for tab in &mut self.tabs {
+            if let Some(profile) = profiles.get(tab.profile_index) {
+                // Update profile-derived fields
+                tab.profile_name = profile.name.clone();
+                tab.profile_icon = profile.icon.clone();
+                tab.title_format = profile.title.clone();
+                // Note: working_directory is intentionally NOT updated since it was
+                // the directory used when the tab was created (affects %w token)
+
+                // Re-expand the title with the new format
+                let window_title = tab.process.get_window_title();
+                let context = TitleContext {
+                    profile_name: &tab.profile_name,
+                    working_directory: &tab.working_directory,
+                    window_title: &window_title,
+                };
+                let new_title = expand_title(&tab.title_format, &context);
+                tab.cached_title = if new_title.is_empty() {
+                    tab.profile_name.clone()
+                } else {
+                    new_title
+                };
+            }
+            // If profile_index is out of bounds, keep current values (profile was removed)
+        }
+    }
 }
 
 impl Default for TabManager {

@@ -6,6 +6,7 @@ mod hotkeys;
 mod icons;
 mod process;
 mod tabs;
+mod watcher;
 mod window;
 
 use anyhow::Result;
