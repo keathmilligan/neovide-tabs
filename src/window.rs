@@ -190,6 +190,8 @@ struct OverflowPopupState {
     parent_hwnd: HWND,
     tabs: Vec<OverflowTabInfo>,
     hovered_item: Option<usize>,
+    /// Which item's close button is hovered (index)
+    hovered_close: Option<usize>,
     background_color: u32,
 }
 
@@ -786,7 +788,7 @@ fn paint_tab(
         SetTextColor(hdc, COLORREF(0x00FFFFFF)); // White text
 
         let mut lf = LOGFONTW::default();
-        lf.lfHeight = -12;
+        lf.lfHeight = -11;
         lf.lfWeight = 400;
         let font_name = "Segoe UI";
         for (i, c) in font_name.encode_utf16().enumerate() {
@@ -1386,6 +1388,7 @@ fn create_overflow_popup(
             parent_hwnd,
             tabs,
             hovered_item: None,
+            hovered_close: None,
             background_color,
         });
 
@@ -1591,8 +1594,19 @@ unsafe extern "system" fn overflow_proc(
                         let text_x = item_rect.left + ICON_SIZE + 8;
                         let text_y = (item_rect.top + item_rect.bottom - text_height) / 2;
 
-                        // Calculate available width for text and truncate if needed
-                        let max_text_width = item_rect.right - text_x - 4;
+                        // Calculate close button rect (on the far right)
+                        let close_size = TAB_CLOSE_SIZE;
+                        let close_left = item_rect.right - TAB_CLOSE_PADDING - close_size;
+                        let close_top = (item_rect.top + item_rect.bottom - close_size) / 2;
+                        let close_rect = RECT {
+                            left: close_left,
+                            top: close_top,
+                            right: close_left + close_size,
+                            bottom: close_top + close_size,
+                        };
+
+                        // Calculate available width for text (leave room for close button)
+                        let max_text_width = close_rect.left - text_x - 4;
                         let label_wide: Vec<u16> = tab_info.label.encode_utf16().collect();
                         let mut text_size = SIZE::default();
                         GetTextExtentPoint32W(hdc, &label_wide, &mut text_size);
@@ -1629,6 +1643,31 @@ unsafe extern "system" fn overflow_proc(
 
                         SelectObject(hdc, old_font);
                         DeleteObject(HGDIOBJ(font.0));
+
+                        // Draw close button
+                        // Close button background on hover
+                        if state.hovered_close == Some(i) {
+                            let close_hover_brush =
+                                CreateSolidBrush(COLORREF(rgb_to_colorref(TAB_CLOSE_HOVER_COLOR)));
+                            FillRect(hdc, &close_rect, close_hover_brush);
+                            DeleteObject(HGDIOBJ(close_hover_brush.0));
+                        }
+
+                        // Draw X for close button
+                        let close_pen = CreatePen(PS_SOLID, 1, COLORREF(0x00FFFFFF));
+                        let old_pen = SelectObject(hdc, HGDIOBJ(close_pen.0));
+
+                        let cx = (close_rect.left + close_rect.right) / 2;
+                        let cy = (close_rect.top + close_rect.bottom) / 2;
+                        let x_size = 4;
+
+                        MoveToEx(hdc, cx - x_size, cy - x_size, None);
+                        LineTo(hdc, cx + x_size + 1, cy + x_size + 1);
+                        MoveToEx(hdc, cx + x_size, cy - x_size, None);
+                        LineTo(hdc, cx - x_size - 1, cy + x_size + 1);
+
+                        SelectObject(hdc, old_pen);
+                        DeleteObject(HGDIOBJ(close_pen.0));
                     }
                 }
 
@@ -1637,11 +1676,16 @@ unsafe extern "system" fn overflow_proc(
             }
 
             WM_MOUSEMOVE => {
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
 
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut OverflowPopupState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
+
+                    // Get popup rect for calculating close button positions
+                    let mut rect = RECT::default();
+                    GetClientRect(hwnd, &mut rect).ok();
 
                     // Calculate which item is hovered
                     let item_index = (y - DROPDOWN_PADDING) / DROPDOWN_ITEM_HEIGHT;
@@ -1652,8 +1696,32 @@ unsafe extern "system" fn overflow_proc(
                         None
                     };
 
-                    if state.hovered_item != new_hovered {
-                        state.hovered_item = new_hovered;
+                    // Check if close button is hovered
+                    let new_hovered_close = if let Some(idx) = new_hovered {
+                        let item_top = DROPDOWN_PADDING + (idx as i32 * DROPDOWN_ITEM_HEIGHT);
+                        let item_right = rect.right - DROPDOWN_PADDING;
+                        let close_size = TAB_CLOSE_SIZE;
+                        let close_left = item_right - TAB_CLOSE_PADDING - close_size;
+                        let close_top = (item_top + item_top + DROPDOWN_ITEM_HEIGHT - close_size) / 2;
+                        let close_right = close_left + close_size;
+                        let close_bottom = close_top + close_size;
+
+                        if x >= close_left && x < close_right && y >= close_top && y < close_bottom {
+                            Some(idx)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+
+                    let needs_repaint = state.hovered_item != new_hovered
+                        || state.hovered_close != new_hovered_close;
+
+                    state.hovered_item = new_hovered;
+                    state.hovered_close = new_hovered_close;
+
+                    if needs_repaint {
                         InvalidateRect(hwnd, None, false);
                     }
                 }
@@ -1676,15 +1744,42 @@ unsafe extern "system" fn overflow_proc(
                         // Click inside - check which item
                         let item_index = (y - DROPDOWN_PADDING) / DROPDOWN_ITEM_HEIGHT;
                         if item_index >= 0 && (item_index as usize) < state.tabs.len() {
-                            // Send custom message to parent with original tab index
-                            let tab_index = state.tabs[item_index as usize].index;
-                            PostMessageW(
-                                state.parent_hwnd,
-                                WM_APP + 2, // New message for overflow tab selection
-                                WPARAM(tab_index),
-                                LPARAM(0),
-                            )
-                            .ok();
+                            let idx = item_index as usize;
+                            let tab_index = state.tabs[idx].index;
+
+                            // Check if close button was clicked
+                            let item_top = DROPDOWN_PADDING + (idx as i32 * DROPDOWN_ITEM_HEIGHT);
+                            let item_right = rect.right - DROPDOWN_PADDING;
+                            let close_size = TAB_CLOSE_SIZE;
+                            let close_left = item_right - TAB_CLOSE_PADDING - close_size;
+                            let close_top =
+                                (item_top + item_top + DROPDOWN_ITEM_HEIGHT - close_size) / 2;
+                            let close_right = close_left + close_size;
+                            let close_bottom = close_top + close_size;
+
+                            if x >= close_left
+                                && x < close_right
+                                && y >= close_top
+                                && y < close_bottom
+                            {
+                                // Close button clicked - send close message
+                                PostMessageW(
+                                    state.parent_hwnd,
+                                    WM_APP + 4, // Message for overflow tab close
+                                    WPARAM(tab_index),
+                                    LPARAM(0),
+                                )
+                                .ok();
+                            } else {
+                                // Tab item clicked - send selection message
+                                PostMessageW(
+                                    state.parent_hwnd,
+                                    WM_APP + 2, // Message for overflow tab selection
+                                    WPARAM(tab_index),
+                                    LPARAM(0),
+                                )
+                                .ok();
+                            }
                         }
                     } else {
                         // Click outside - just notify parent to close
@@ -3108,6 +3203,34 @@ unsafe extern "system" fn window_proc(
             if !state_ptr.is_null() {
                 let state = &mut *state_ptr;
                 state.overflow_hwnd = None; // Popup already destroyed itself
+                InvalidateRect(hwnd, None, false);
+            }
+            LRESULT(0)
+        }
+
+        // WM_APP + 4: Overflow tab close button clicked (wparam = tab index)
+        msg if msg == WM_APP + 4 => {
+            let tab_index = wparam.0;
+            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
+            if !state_ptr.is_null() {
+                let state = &mut *state_ptr;
+                state.overflow_hwnd = None; // Popup already destroyed itself
+
+                // Request graceful close - sends WM_CLOSE to Neovide window
+                // Process polling will detect when process exits and remove the tab
+                // If window not ready, falls back to forceful close
+                let graceful = state.tab_manager.request_close_tab(tab_index);
+                if !graceful {
+                    // Forceful close occurred - tab already removed
+                    // Check if that was the last tab
+                    if state.tab_manager.is_empty() {
+                        PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+                    } else {
+                        // Activate the newly selected tab
+                        state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
+                    }
+                }
+                // If graceful, do nothing - process polling handles tab removal
                 InvalidateRect(hwnd, None, false);
             }
             LRESULT(0)
