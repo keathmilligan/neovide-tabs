@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent,
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -2415,12 +2415,15 @@ unsafe extern "system" fn window_proc(
 
                     // Check if in title bar area
                     if pt.y >= 0 && pt.y < TITLEBAR_HEIGHT {
-                        // Check window control buttons first
+                        // Check window control buttons first - return HTCLIENT so we handle
+                        // them ourselves (prevents Windows from drawing default buttons)
                         let button = hit_test_buttons(pt.x, pt.y, client_width);
                         match button {
-                            HoveredButton::Minimize => return LRESULT(HTMINBUTTON as isize),
-                            HoveredButton::Maximize => return LRESULT(HTMAXBUTTON as isize),
-                            HoveredButton::Close => return LRESULT(HTCLOSE as isize),
+                            HoveredButton::Minimize
+                            | HoveredButton::Maximize
+                            | HoveredButton::Close => {
+                                return LRESULT(HTCLIENT as isize);
+                            }
                             HoveredButton::None => {
                                 // Check tab bar area
                                 let state_ptr =
@@ -2462,68 +2465,14 @@ unsafe extern "system" fn window_proc(
         }
 
         WM_NCMOUSEMOVE => {
-            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-
-                // Track mouse to get WM_NCMOUSELEAVE
-                if !state.tracking_mouse {
-                    let mut tme = TRACKMOUSEEVENT {
-                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                        dwFlags: TME_LEAVE | TME_NONCLIENT,
-                        hwndTrack: hwnd,
-                        dwHoverTime: 0,
-                    };
-                    TrackMouseEvent(&mut tme);
-                    state.tracking_mouse = true;
-                }
-
-                // Determine which button is hovered based on wparam (hit test result)
-                let new_hover = match wparam.0 as u32 {
-                    x if x == HTMINBUTTON => HoveredButton::Minimize,
-                    x if x == HTMAXBUTTON => HoveredButton::Maximize,
-                    x if x == HTCLOSE => HoveredButton::Close,
-                    _ => HoveredButton::None,
-                };
-
-                if new_hover != state.hovered_button {
-                    state.hovered_button = new_hover;
-                    // Invalidate title bar to repaint
-                    let mut client_rect = RECT::default();
-                    if GetClientRect(hwnd, &mut client_rect).is_ok() {
-                        let titlebar_rect = RECT {
-                            left: 0,
-                            top: 0,
-                            right: client_rect.right,
-                            bottom: TITLEBAR_HEIGHT,
-                        };
-                        InvalidateRect(hwnd, Some(&titlebar_rect), false);
-                    }
-                }
-            }
+            // Non-client mouse movement (resize borders, etc.)
+            // Window buttons are now handled in client area via WM_MOUSEMOVE
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
         WM_NCMOUSELEAVE => {
-            let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
-            if !state_ptr.is_null() {
-                let state = &mut *state_ptr;
-                state.tracking_mouse = false;
-                if state.hovered_button != HoveredButton::None {
-                    state.hovered_button = HoveredButton::None;
-                    // Invalidate title bar to repaint
-                    let mut client_rect = RECT::default();
-                    if GetClientRect(hwnd, &mut client_rect).is_ok() {
-                        let titlebar_rect = RECT {
-                            left: 0,
-                            top: 0,
-                            right: client_rect.right,
-                            bottom: TITLEBAR_HEIGHT,
-                        };
-                        InvalidateRect(hwnd, Some(&titlebar_rect), false);
-                    }
-                }
-            }
+            // Non-client mouse leave - just defer to default handling
+            // Button hover is now tracked via WM_MOUSELEAVE
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
 
@@ -2534,9 +2483,13 @@ unsafe extern "system" fn window_proc(
                 let state = &mut *state_ptr;
                 state.tracking_mouse = false;
 
-                // Clear tab hover state
-                if state.hovered_tab != HoveredTab::None {
-                    state.hovered_tab = HoveredTab::None;
+                // Clear hover states
+                let needs_repaint = state.hovered_tab != HoveredTab::None
+                    || state.hovered_button != HoveredButton::None;
+                state.hovered_tab = HoveredTab::None;
+                state.hovered_button = HoveredButton::None;
+
+                if needs_repaint {
                     let mut client_rect = RECT::default();
                     if GetClientRect(hwnd, &mut client_rect).is_ok() {
                         let titlebar_rect = RECT {
@@ -2888,6 +2841,40 @@ unsafe extern "system" fn window_proc(
                 if GetClientRect(hwnd, &mut client_rect).is_ok() {
                     let client_width = client_rect.right;
 
+                    // Check window control buttons first
+                    let button = hit_test_buttons(x, y, client_width);
+                    match button {
+                        HoveredButton::Close => {
+                            // Close popups if open
+                            hide_dropdown_popup(hwnd, state);
+                            hide_overflow_popup(hwnd, state);
+                            // Close the window
+                            PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)).ok();
+                            return LRESULT(0);
+                        }
+                        HoveredButton::Maximize => {
+                            // Close popups if open
+                            hide_dropdown_popup(hwnd, state);
+                            hide_overflow_popup(hwnd, state);
+                            // Toggle maximize/restore
+                            if IsZoomed(hwnd).as_bool() {
+                                ShowWindow(hwnd, SW_RESTORE);
+                            } else {
+                                ShowWindow(hwnd, SW_MAXIMIZE);
+                            }
+                            return LRESULT(0);
+                        }
+                        HoveredButton::Minimize => {
+                            // Close popups if open
+                            hide_dropdown_popup(hwnd, state);
+                            hide_overflow_popup(hwnd, state);
+                            // Minimize the window
+                            ShowWindow(hwnd, SW_MINIMIZE);
+                            return LRESULT(0);
+                        }
+                        HoveredButton::None => {}
+                    }
+
                     let tab_hit = hit_test_tab_bar(x, y, state.tab_manager.count(), client_width);
 
                     match tab_hit {
@@ -3091,6 +3078,15 @@ unsafe extern "system" fn window_proc(
                     if GetClientRect(hwnd, &mut client_rect).is_ok() {
                         let client_width = client_rect.right;
 
+                        // Check window control buttons first
+                        let new_button_hover = hit_test_buttons(x, y, client_width);
+                        let mut needs_repaint = false;
+
+                        if new_button_hover != state.hovered_button {
+                            state.hovered_button = new_button_hover;
+                            needs_repaint = true;
+                        }
+
                         // Hit test the tab bar (dropdown popup handles its own mouse tracking)
                         let tab_hit =
                             hit_test_tab_bar(x, y, state.tab_manager.count(), client_width);
@@ -3105,6 +3101,10 @@ unsafe extern "system" fn window_proc(
 
                         if new_hover != state.hovered_tab {
                             state.hovered_tab = new_hover;
+                            needs_repaint = true;
+                        }
+
+                        if needs_repaint {
                             let titlebar_rect = RECT {
                                 left: 0,
                                 top: 0,
