@@ -121,7 +121,7 @@ The system SHALL generate an internal "Default" profile only when no profiles ar
 - **AND** the profiles list SHALL contain only the user-defined profiles
 
 ### Requirement: Profile Icon Loading
-The system SHALL load profile icons using the following resolution: the default icon is loaded from the data directory, and user-defined icons are loaded from full paths.
+The system SHALL load profile icons using the following resolution: the default icon is loaded from the data directory, and user-defined icons are loaded from full paths. Both PNG and SVG formats are supported for user-defined icons.
 
 #### Scenario: Default icon loading
 - **WHEN** a profile uses the default icon (`neovide-tabs.png`)
@@ -142,6 +142,18 @@ The system SHALL load profile icons using the following resolution: the default 
 #### Scenario: Default icon for profile without icon field
 - **WHEN** a profile does not specify an `icon` field
 - **THEN** the icon SHALL default to `neovide-tabs.png` (loaded from data directory)
+
+#### Scenario: SVG icon loading
+- **WHEN** a profile specifies an icon path ending in `.svg`
+- **AND** the file exists and contains valid SVG content
+- **THEN** the SVG SHALL be rasterized to the icon size (16x16 pixels)
+- **AND** the rasterized bitmap SHALL be cached for rendering
+
+#### Scenario: Invalid SVG file
+- **WHEN** a profile specifies an icon path ending in `.svg`
+- **AND** the file exists but contains invalid SVG content
+- **THEN** the default fallback icon (green square) SHALL be used
+- **AND** no error SHALL be displayed to the user
 
 ### Requirement: Bundled Default Icon
 The system SHALL embed the default tab icon (`neovide-tabs.png`) into the executable at compile time and extract it to the data directory at runtime.
