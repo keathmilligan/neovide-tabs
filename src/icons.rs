@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
-    DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HGDIOBJ, ReleaseDC, SetDIBits,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HGDIOBJ, ReleaseDC,
+    SetDIBits,
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO};
 
@@ -96,6 +97,7 @@ impl IconCache {
     /// Load an icon from the appropriate location.
     /// Default icon: loaded from data directory (~/.local/share/neovide-tabs/)
     /// User icon: loaded from the full path specified
+    /// Supports both PNG and SVG formats (detected by file extension).
     fn load_icon(&self, icon_path: &str) -> Option<CachedIcon> {
         let path = if icon_path == DEFAULT_ICON {
             // Default icon - load from data directory
@@ -111,7 +113,16 @@ impl IconCache {
             return None;
         }
 
-        load_png_as_bitmap(&path)
+        // Check file extension to determine loader
+        let extension = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_lowercase());
+
+        match extension.as_deref() {
+            Some("svg") => load_svg_as_bitmap(&path),
+            _ => load_png_as_bitmap(&path),
+        }
     }
 
     /// Get the fallback icon (creates it if needed)
@@ -312,6 +323,73 @@ fn create_hicon_from_rgba(rgba: &image::RgbaImage, size: i32) -> Option<HICON> {
     }
 }
 
+/// Render size multiplier for high-quality SVG rasterization.
+/// SVG is rendered at this multiple of the target size, then downsampled.
+const SVG_RENDER_SCALE: u32 = 4;
+
+/// Load an SVG file, rasterize it, and convert to a Win32 HBITMAP
+fn load_svg_as_bitmap(path: &Path) -> Option<CachedIcon> {
+    // Read the SVG file
+    let svg_data = fs::read(path).ok()?;
+
+    // Parse the SVG using resvg
+    let options = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_data(&svg_data, &options).ok()?;
+
+    // Render at higher resolution for quality, then downsample
+    let render_size = ICON_SIZE as u32 * SVG_RENDER_SCALE;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(render_size, render_size)?;
+
+    // Calculate the transform to fit the SVG into the render size
+    let svg_size = tree.size();
+    let scale_x = render_size as f32 / svg_size.width();
+    let scale_y = render_size as f32 / svg_size.height();
+    let scale = scale_x.min(scale_y);
+
+    // Center the SVG in the pixmap
+    let offset_x = (render_size as f32 - svg_size.width() * scale) / 2.0;
+    let offset_y = (render_size as f32 - svg_size.height() * scale) / 2.0;
+
+    let transform = resvg::tiny_skia::Transform::from_scale(scale, scale)
+        .post_translate(offset_x, offset_y);
+
+    // Render the SVG
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+    // Convert to image::RgbaImage (resvg uses premultiplied alpha, need to unpremultiply)
+    let mut rgba = image::RgbaImage::new(render_size, render_size);
+    for (i, pixel) in pixmap.pixels().iter().enumerate() {
+        let x = (i % render_size as usize) as u32;
+        let y = (i / render_size as usize) as u32;
+
+        // Unpremultiply alpha for the image crate
+        let a = pixel.alpha();
+        let (r, g, b) = if a == 0 {
+            (0, 0, 0)
+        } else {
+            let a_f = a as f32 / 255.0;
+            (
+                (pixel.red() as f32 / a_f).min(255.0) as u8,
+                (pixel.green() as f32 / a_f).min(255.0) as u8,
+                (pixel.blue() as f32 / a_f).min(255.0) as u8,
+            )
+        };
+
+        rgba.put_pixel(x, y, image::Rgba([r, g, b, a]));
+    }
+
+    // Downsample to target size using high-quality filter
+    let img = image::DynamicImage::ImageRgba8(rgba);
+    let resized = img.resize_exact(
+        ICON_SIZE as u32,
+        ICON_SIZE as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let rgba = resized.to_rgba8();
+
+    create_bitmap_from_rgba(&rgba, ICON_SIZE, ICON_SIZE)
+}
+
 /// Load a PNG file and convert it to a Win32 HBITMAP
 fn load_png_as_bitmap(path: &Path) -> Option<CachedIcon> {
     // Load the image using the image crate
@@ -333,7 +411,8 @@ fn load_png_as_bitmap(path: &Path) -> Option<CachedIcon> {
     create_bitmap_from_rgba(&rgba, width, height)
 }
 
-/// Create a Win32 HBITMAP from RGBA pixel data
+/// Create a Win32 HBITMAP from RGBA pixel data.
+/// Uses a DIB section with premultiplied alpha for AlphaBlend compatibility.
 fn create_bitmap_from_rgba(rgba: &image::RgbaImage, width: i32, height: i32) -> Option<CachedIcon> {
     unsafe {
         // Get a device context for the screen
@@ -342,22 +421,7 @@ fn create_bitmap_from_rgba(rgba: &image::RgbaImage, width: i32, height: i32) -> 
             return None;
         }
 
-        // Create a compatible DC
-        let mem_dc = CreateCompatibleDC(screen_dc);
-        if mem_dc.is_invalid() {
-            ReleaseDC(HWND::default(), screen_dc);
-            return None;
-        }
-
-        // Create a 32-bit bitmap
-        let hbitmap = CreateCompatibleBitmap(screen_dc, width, height);
-        if hbitmap.is_invalid() {
-            let _ = DeleteDC(mem_dc);
-            ReleaseDC(HWND::default(), screen_dc);
-            return None;
-        }
-
-        // Set up bitmap info for 32-bit BGRA
+        // Set up bitmap info for 32-bit BGRA DIB section
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -375,33 +439,43 @@ fn create_bitmap_from_rgba(rgba: &image::RgbaImage, width: i32, height: i32) -> 
             bmiColors: [Default::default()],
         };
 
-        // Convert RGBA to BGRA (Win32 expects BGRA)
-        let mut bgra_data: Vec<u8> = Vec::with_capacity((width * height * 4) as usize);
-        for pixel in rgba.pixels() {
-            bgra_data.push(pixel[2]); // B
-            bgra_data.push(pixel[1]); // G
-            bgra_data.push(pixel[0]); // R
-            bgra_data.push(pixel[3]); // A
-        }
-
-        // Set the bitmap bits
-        let result = SetDIBits(
-            mem_dc,
-            hbitmap,
-            0,
-            height as u32,
-            bgra_data.as_ptr() as *const std::ffi::c_void,
+        // Create a DIB section (supports alpha channel properly)
+        let mut bits_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let hbitmap = CreateDIBSection(
+            screen_dc,
             &bmi,
             DIB_RGB_COLORS,
+            &mut bits_ptr,
+            None,
+            0,
         );
 
-        // Clean up DCs
-        let _ = DeleteDC(mem_dc);
         ReleaseDC(HWND::default(), screen_dc);
 
-        if result == 0 {
-            let _ = DeleteObject(HGDIOBJ(hbitmap.0));
+        let hbitmap = hbitmap.ok()?;
+        if hbitmap.is_invalid() || bits_ptr.is_null() {
             return None;
+        }
+
+        // Copy pixel data with premultiplied alpha (required for AlphaBlend)
+        let bits = std::slice::from_raw_parts_mut(
+            bits_ptr as *mut u8,
+            (width * height * 4) as usize,
+        );
+
+        for (i, pixel) in rgba.pixels().enumerate() {
+            let offset = i * 4;
+            let r = pixel[0];
+            let g = pixel[1];
+            let b = pixel[2];
+            let a = pixel[3];
+
+            // Premultiply alpha for AlphaBlend
+            let a_f = a as f32 / 255.0;
+            bits[offset] = (b as f32 * a_f) as u8;     // B
+            bits[offset + 1] = (g as f32 * a_f) as u8; // G
+            bits[offset + 2] = (r as f32 * a_f) as u8; // R
+            bits[offset + 3] = a;                       // A
         }
 
         Some(CachedIcon {
@@ -459,5 +533,55 @@ mod tests {
         assert!(path.is_some());
         let path = path.unwrap();
         assert!(path.to_string_lossy().contains("neovide-tabs"));
+    }
+
+    #[test]
+    fn test_svg_parsing_valid() {
+        // Test that valid SVG data can be parsed
+        let svg_data = br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">
+            <rect width="16" height="16" fill="green"/>
+        </svg>"#;
+
+        let options = resvg::usvg::Options::default();
+        let result = resvg::usvg::Tree::from_data(svg_data, &options);
+        assert!(result.is_ok(), "Valid SVG should parse successfully");
+    }
+
+    #[test]
+    fn test_svg_parsing_invalid() {
+        // Test that invalid SVG data fails gracefully
+        let invalid_svg = b"not valid svg content at all";
+
+        let options = resvg::usvg::Options::default();
+        let result = resvg::usvg::Tree::from_data(invalid_svg, &options);
+        assert!(result.is_err(), "Invalid SVG should fail to parse");
+    }
+
+    #[test]
+    fn test_svg_rasterization() {
+        // Test that SVG can be rasterized to a pixmap
+        let svg_data = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100">
+            <circle cx="50" cy="50" r="40" fill="blue"/>
+        </svg>"#;
+
+        let options = resvg::usvg::Options::default();
+        let tree = resvg::usvg::Tree::from_data(svg_data, &options).unwrap();
+
+        let size = ICON_SIZE as u32;
+        let pixmap = resvg::tiny_skia::Pixmap::new(size, size);
+        assert!(pixmap.is_some(), "Pixmap should be created");
+
+        let mut pixmap = pixmap.unwrap();
+
+        // Scale SVG to fit the icon size (same logic as load_svg_as_bitmap)
+        let svg_size = tree.size();
+        let scale = (size as f32 / svg_size.width()).min(size as f32 / svg_size.height());
+        let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+        // Verify the pixmap has some non-zero pixels (was rendered)
+        let has_content = pixmap.pixels().iter().any(|p| p.alpha() > 0);
+        assert!(has_content, "Rendered SVG should have visible content");
     }
 }

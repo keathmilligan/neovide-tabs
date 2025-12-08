@@ -10,12 +10,12 @@ use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
-    BITMAP, BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect,
-    GetObjectW, GetTextExtentPoint32W, GetTextMetricsW, HBITMAP, HBRUSH, HGDIOBJ, InvalidateRect,
-    LOGFONTW, LineTo, MoveToEx, PAINTSTRUCT, PS_SOLID, SRCCOPY, STRETCH_HALFTONE, ScreenToClient,
-    SelectObject, SetBkMode, SetStretchBltMode, SetTextColor, StretchBlt, TEXTMETRICW, TRANSPARENT,
-    TextOutW,
+    AC_SRC_ALPHA, AC_SRC_OVER, BITMAP, BLENDFUNCTION, BeginPaint, BitBlt, ClientToScreen,
+    CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW, CreatePen, CreateSolidBrush,
+    DeleteDC, DeleteObject, EndPaint, FillRect, GdiAlphaBlend, GetObjectW, GetTextExtentPoint32W,
+    GetTextMetricsW, HBITMAP, HBRUSH, HGDIOBJ, InvalidateRect, LOGFONTW, LineTo, MoveToEx,
+    PAINTSTRUCT, PS_SOLID, SRCCOPY, ScreenToClient, SelectObject, SetBkMode, SetTextColor,
+    TEXTMETRICW, TRANSPARENT, TextOutW,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -881,7 +881,7 @@ fn paint_tab(
     }
 }
 
-/// Paint an icon bitmap to the device context
+/// Paint an icon bitmap to the device context with alpha blending
 #[allow(unused_must_use)]
 fn paint_icon(
     hdc: windows::Win32::Graphics::Gdi::HDC,
@@ -912,11 +912,16 @@ fn paint_icon(
 
         let old_bitmap = SelectObject(mem_dc, HGDIOBJ(hbitmap.0));
 
-        // Set stretch mode for better quality
-        SetStretchBltMode(hdc, STRETCH_HALFTONE);
+        // Set up blend function for per-pixel alpha
+        let blend_func = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            BlendFlags: 0,
+            SourceConstantAlpha: 255, // Use per-pixel alpha
+            AlphaFormat: AC_SRC_ALPHA as u8,
+        };
 
-        // Stretch blit the bitmap to the destination
-        StretchBlt(
+        // Alpha blend the bitmap to the destination
+        GdiAlphaBlend(
             hdc,
             x,
             y,
@@ -927,7 +932,7 @@ fn paint_icon(
             0,
             bm.bmWidth,
             bm.bmHeight,
-            SRCCOPY,
+            blend_func,
         );
 
         // Clean up
