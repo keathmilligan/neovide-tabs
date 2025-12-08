@@ -14,8 +14,9 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 
 - **Tab Support**: Create, close, and switch between multiple Neovide instances using tabs
 - **Tab Reordering**: Drag tabs to rearrange their order
+- **Dynamic Tab Titles**: Customizable tab titles with token expansion (profile name, working directory, or Neovide window title)
 - **Global Hotkeys**: System-wide keyboard shortcuts to switch tabs or open profiles from any application
-- **Profile Support**: Configure multiple profiles with custom working directories, icons, and hotkeys
+- **Profile Support**: Configure multiple profiles with custom working directories, icons, hotkeys, and title formats
 - **Custom Icons**: Per-profile PNG icons loaded from `~/.config/neovide-tabs/icons/`
 - **Configurable**: JSON configuration file for background color, profiles, and hotkeys
 - **Custom Titlebar**: Native custom titlebar with Windows 11 rounded corners
@@ -29,36 +30,27 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 
 ## Prerequisites
 
-- [Neovide](https://neovide.dev) must be installed and available in your system PATH
+- [NeoVim](https://neovim.io/) must be installed and available in your system PATH
+- [NeoVide](https://neovide.dev) must be installed and available in your system PATH
 - Rust toolchain (2024 edition or later)
 
-### Installing Neovide
-
-```bash
-# Using winget
-winget install Neovide.Neovide
-
-# Using Scoop
-scoop install neovide
-
-# Or download from releases
-# https://github.com/neovide/neovide/releases
-```
-
 ## Getting Started
+
+`neovide-tabs` is in development. To use it, you will need to be able to compile Rust programs for Windows. To get started, see [https://rust-lang.org/tools/install/](https://rust-lang.org/tools/install/).
 
 ### Building from Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/neovide-tabs.git
+git clone https://github.com/keathmilligan/neovide-tabs.git
 cd neovide-tabs
 
-# Build the project
+# Build the project and copy the target\release\neovide-tabs.exe
+# to your local ~\bin directory (or equivalent)
 cargo build --release
 
-# Run the application
-cargo run --release
+# Alternayively, run the application from the workspace
+cargo run
 ```
 
 ### Development
@@ -137,7 +129,8 @@ Configuration is stored at `~/.config/neovide-tabs/config.json`:
       "name": "Work",
       "icon": "work.png",
       "working_directory": "~/projects/work",
-      "hotkey": "Ctrl+Shift+F2"
+      "hotkey": "Ctrl+Shift+F2",
+      "title": "%t"
     }
   ],
   "hotkeys": {
@@ -154,10 +147,11 @@ Configuration is stored at `~/.config/neovide-tabs/config.json`:
 
 - `background_color`: Hex color for the titlebar and content area border (default: `#1a1b26` - Tokyo Night)
 - `profiles`: Array of profile definitions:
-  - `name`: Display name shown on tabs
+  - `name`: Display name shown on tabs (used as fallback when title is empty)
   - `icon`: PNG filename (loaded from `~/.config/neovide-tabs/icons/`)
   - `working_directory`: Starting directory for Neovide (supports `~` expansion)
   - `hotkey`: (optional) Global hotkey to open/activate this profile (e.g., `"Ctrl+Shift+F1"`)
+  - `title`: (optional) Tab title format with token expansion (default: `"%t"`)
 - `hotkeys`: (optional) Hotkey configuration:
   - `tab`: Map of tab number to hotkey string (e.g., `{"1": "Ctrl+Shift+1"}`)
 
@@ -217,7 +211,7 @@ The application consists of seven main modules:
 
 ## Contributing
 
-Contributions are welcome! Please read the development guidelines in `AGENTS.md` and `openspec/AGENTS.md` before submitting pull requests.
+Contributions are welcome!
 
 ### Code Style
 
@@ -228,15 +222,9 @@ Contributions are welcome! Please read the development guidelines in `AGENTS.md`
 
 ## License
 
-[License TBD]
+MIT
 
 ## Acknowledgments
 
 - [Neovide](https://neovide.dev) - The excellent Neovim GUI that this project wraps
 - [Neovim](https://neovim.io) - The extensible text editor
-
-## Project Status
-
-**Current Version:** 0.4.0 (Global Hotkeys)
-
-The application now supports global hotkeys for tab navigation and profile activation. System-wide keyboard shortcuts (Ctrl+Shift+1-9,0) switch between tabs, and profile-specific hotkeys open or activate tabs with that profile. Each profile can have a custom name, icon, working directory, and hotkey. Users can create tabs from any profile via a dropdown menu, close tabs gracefully (respecting unsaved changes), switch between tabs, and reorder them via drag-and-drop.

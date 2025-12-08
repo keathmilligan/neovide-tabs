@@ -77,7 +77,15 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r##"// neovide-tabs configuration file
         //     "working_directory": "~/projects/work",
         //     // Global hotkey (optional) - opens or activates a tab with this profile
         //     // Format: Modifier+Key (e.g., Ctrl+Shift+F2, Alt+Shift+W)
-        //     "hotkey": "Ctrl+Shift+F2"
+        //     "hotkey": "Ctrl+Shift+F2",
+        //     // Tab title format (optional) - dynamic tab title with token expansion
+        //     // Supported tokens:
+        //     //   %p - Profile name
+        //     //   %w - Working directory (uses ~/xxx for paths under home)
+        //     //   %t - Neovide window title (current file/buffer)
+        //     // Defaults to "%t" (Neovide window title)
+        //     // Examples: "%t", "%p: %w", "%p - %t"
+        //     "title": "%t"
         // },
         // {
         //     // Minimal profile example - only name is required
@@ -86,6 +94,9 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r##"// neovide-tabs configuration file
     ]
 }
 "##;
+
+/// Default title format for profiles (Neovide window title)
+pub const DEFAULT_TITLE_FORMAT: &str = "%t";
 
 /// Raw profile as read from JSON file
 #[derive(Debug, Deserialize, Clone)]
@@ -98,6 +109,9 @@ struct ProfileFile {
     working_directory: Option<String>,
     /// Global hotkey for this profile (optional, e.g., "Ctrl+Shift+F1")
     hotkey: Option<String>,
+    /// Tab title format string (optional, defaults to "%t")
+    /// Supports tokens: %p (profile name), %w (working directory), %t (Neovide window title)
+    title: Option<String>,
 }
 
 /// Raw hotkey configuration as read from JSON file
@@ -129,6 +143,8 @@ pub struct Profile {
     pub working_directory: PathBuf,
     /// Global hotkey for this profile (e.g., "Ctrl+Shift+F1")
     pub hotkey: Option<String>,
+    /// Tab title format string (supports %p, %w, %t tokens)
+    pub title: String,
 }
 
 /// Parsed hotkey configuration
@@ -146,6 +162,7 @@ impl Profile {
             icon: DEFAULT_ICON.to_string(),
             working_directory: dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
             hotkey: Some(DEFAULT_PROFILE_HOTKEY.to_string()),
+            title: DEFAULT_TITLE_FORMAT.to_string(),
         }
     }
 }
@@ -300,12 +317,14 @@ fn parse_profiles(profiles_opt: Option<Vec<ProfileFile>>) -> Vec<Profile> {
                         .map(|wd| resolve_working_directory(&wd, &home_dir))
                         .unwrap_or_else(|| home_dir.clone());
                     let icon = resolve_icon_path(pf.icon, &home_dir);
+                    let title = pf.title.unwrap_or_else(|| DEFAULT_TITLE_FORMAT.to_string());
 
                     Profile {
                         name: pf.name,
                         icon,
                         working_directory,
                         hotkey: pf.hotkey,
+                        title,
                     }
                 })
                 .collect()
@@ -550,6 +569,95 @@ fn parse_hex_color(s: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
+/// Context for title expansion
+pub struct TitleContext<'a> {
+    /// Profile name
+    pub profile_name: &'a str,
+    /// Working directory path
+    pub working_directory: &'a Path,
+    /// Neovide window title (empty if not available)
+    pub window_title: &'a str,
+}
+
+/// Expand a title format string using the provided context.
+/// Supports the following tokens:
+/// - `%p` - Profile name
+/// - `%w` - Working directory (with ~ substitution for home directory)
+/// - `%t` - Neovide window title
+///
+/// After expansion, strips leading/trailing whitespace, tabs, and dashes.
+pub fn expand_title(format: &str, context: &TitleContext) -> String {
+    let home_dir = dirs::home_dir();
+
+    let mut result = String::with_capacity(format.len() * 2);
+    let mut chars = format.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            if let Some(&next) = chars.peek() {
+                match next {
+                    'p' => {
+                        chars.next();
+                        result.push_str(context.profile_name);
+                    }
+                    'w' => {
+                        chars.next();
+                        let wd_display = format_working_directory(
+                            context.working_directory,
+                            home_dir.as_deref(),
+                        );
+                        result.push_str(&wd_display);
+                    }
+                    't' => {
+                        chars.next();
+                        result.push_str(context.window_title);
+                    }
+                    '%' => {
+                        // Escape sequence: %% becomes %
+                        chars.next();
+                        result.push('%');
+                    }
+                    _ => {
+                        // Unknown token, keep as-is
+                        result.push('%');
+                    }
+                }
+            } else {
+                // % at end of string
+                result.push('%');
+            }
+        } else {
+            result.push(c);
+        }
+    }
+
+    // Strip leading/trailing whitespace, tabs, and dashes
+    sanitize_title(&result)
+}
+
+/// Format a working directory path for display.
+/// Replaces home directory prefix with ~ for brevity.
+fn format_working_directory(path: &Path, home_dir: Option<&Path>) -> String {
+    if let Some(home) = home_dir
+        && let Ok(relative) = path.strip_prefix(home)
+    {
+        if relative.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        // Use forward slashes for consistency in display
+        let relative_str = relative.to_string_lossy();
+        return format!("~/{}", relative_str.replace('\\', "/"));
+    }
+    // Not under home, return full path with forward slashes
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Strip leading and trailing whitespace, tabs, and dash characters from a title.
+fn sanitize_title(title: &str) -> String {
+    let chars_to_strip: &[char] = &[' ', '\t', '-'];
+    title.trim_matches(chars_to_strip).to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,6 +779,7 @@ mod tests {
             icon: Some("custom.png".to_string()),
             working_directory: Some("~".to_string()),
             hotkey: None,
+            title: None,
         }];
         let profiles = parse_profiles(Some(profile_files));
         assert_eq!(profiles.len(), 1);
@@ -678,6 +787,8 @@ mod tests {
         assert_eq!(profiles[0].icon, "custom.png");
         // User-defined Default without hotkey should have no hotkey
         assert_eq!(profiles[0].hotkey, None);
+        // Title should default to %t
+        assert_eq!(profiles[0].title, DEFAULT_TITLE_FORMAT);
     }
 
     #[test]
@@ -688,12 +799,15 @@ mod tests {
             icon: None,
             working_directory: None,
             hotkey: None,
+            title: None,
         }];
         let profiles = parse_profiles(Some(profile_files));
         assert_eq!(profiles.len(), 1);
         // First profile is the user-defined one
         assert_eq!(profiles[0].name, "Work");
         assert_eq!(profiles[0].hotkey, None);
+        // Title should default to %t
+        assert_eq!(profiles[0].title, DEFAULT_TITLE_FORMAT);
     }
 
     #[test]
@@ -705,12 +819,14 @@ mod tests {
                 icon: None,
                 working_directory: None,
                 hotkey: None,
+                title: None,
             },
             ProfileFile {
                 name: "Personal".to_string(),
                 icon: None,
                 working_directory: None,
                 hotkey: Some("Ctrl+Shift+F2".to_string()),
+                title: Some("%p: %w".to_string()),
             },
         ];
         let profiles = parse_profiles(Some(profile_files));
@@ -718,8 +834,10 @@ mod tests {
         // Order is preserved - first defined profile is first
         assert_eq!(profiles[0].name, "Work");
         assert_eq!(profiles[0].hotkey, None);
+        assert_eq!(profiles[0].title, DEFAULT_TITLE_FORMAT);
         assert_eq!(profiles[1].name, "Personal");
         assert_eq!(profiles[1].hotkey, Some("Ctrl+Shift+F2".to_string()));
+        assert_eq!(profiles[1].title, "%p: %w");
     }
 
     #[test]
@@ -830,6 +948,7 @@ mod tests {
             icon: None,
             working_directory: None,
             hotkey: Some("Ctrl+Shift+F2".to_string()),
+            title: None,
         }];
         let profiles = parse_profiles(Some(profile_files));
         assert_eq!(profiles.len(), 1);
@@ -995,5 +1114,187 @@ mod tests {
             result.is_ok(),
             "Default template should parse after stripping comments"
         );
+    }
+
+    // Title expansion tests
+
+    #[test]
+    fn test_expand_title_profile_name() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user/projects"),
+            window_title: "file.rs - Neovim",
+        };
+        let result = expand_title("%p", &context);
+        assert_eq!(result, "Work");
+    }
+
+    #[test]
+    fn test_expand_title_window_title() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user/projects"),
+            window_title: "file.rs - Neovim",
+        };
+        let result = expand_title("%t", &context);
+        assert_eq!(result, "file.rs - Neovim");
+    }
+
+    #[test]
+    fn test_expand_title_working_directory_under_home() {
+        let home = dirs::home_dir().unwrap();
+        let projects_path = home.join("projects").join("myapp");
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &projects_path,
+            window_title: "file.rs",
+        };
+        let result = expand_title("%w", &context);
+        assert_eq!(result, "~/projects/myapp");
+    }
+
+    #[test]
+    fn test_expand_title_working_directory_home() {
+        let home = dirs::home_dir().unwrap();
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &home,
+            window_title: "file.rs",
+        };
+        let result = expand_title("%w", &context);
+        assert_eq!(result, "~");
+    }
+
+    #[test]
+    fn test_expand_title_combined_tokens() {
+        let home = dirs::home_dir().unwrap();
+        let projects_path = home.join("projects");
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &projects_path,
+            window_title: "file.rs",
+        };
+        let result = expand_title("%p: %w", &context);
+        assert_eq!(result, "Work: ~/projects");
+    }
+
+    #[test]
+    fn test_expand_title_strip_leading_dash() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "- Neovim",
+        };
+        let result = expand_title("%t", &context);
+        assert_eq!(result, "Neovim");
+    }
+
+    #[test]
+    fn test_expand_title_strip_trailing_dash() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "Neovim -",
+        };
+        let result = expand_title("%t", &context);
+        assert_eq!(result, "Neovim");
+    }
+
+    #[test]
+    fn test_expand_title_strip_whitespace() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "  Neovim  ",
+        };
+        let result = expand_title("%t", &context);
+        assert_eq!(result, "Neovim");
+    }
+
+    #[test]
+    fn test_expand_title_preserve_internal_dash() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "file.rs - Neovim",
+        };
+        let result = expand_title("%t", &context);
+        assert_eq!(result, "file.rs - Neovim");
+    }
+
+    #[test]
+    fn test_expand_title_empty_window_title() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "",
+        };
+        let result = expand_title("%t", &context);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_expand_title_literal_text() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "file.rs",
+        };
+        let result = expand_title("Tab: %p", &context);
+        assert_eq!(result, "Tab: Work");
+    }
+
+    #[test]
+    fn test_expand_title_escape_percent() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "file.rs",
+        };
+        let result = expand_title("100%% complete", &context);
+        assert_eq!(result, "100% complete");
+    }
+
+    #[test]
+    fn test_expand_title_unknown_token() {
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &PathBuf::from("/home/user"),
+            window_title: "file.rs",
+        };
+        // Unknown tokens like %x are kept as-is (just the %)
+        let result = expand_title("%x", &context);
+        assert_eq!(result, "%x");
+    }
+
+    #[test]
+    fn test_sanitize_title_all_strip_chars() {
+        let result = sanitize_title("---");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_sanitize_title_mixed_strip_chars() {
+        let result = sanitize_title("- \t");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_profile_title_custom() {
+        let profile_files = vec![ProfileFile {
+            name: "Custom".to_string(),
+            icon: None,
+            working_directory: None,
+            hotkey: None,
+            title: Some("%p: %w".to_string()),
+        }];
+        let profiles = parse_profiles(Some(profile_files));
+        assert_eq!(profiles[0].title, "%p: %w");
+    }
+
+    #[test]
+    fn test_default_profile_has_title() {
+        let profile = Profile::default_profile();
+        assert_eq!(profile.title, DEFAULT_TITLE_FORMAT);
     }
 }

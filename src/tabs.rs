@@ -4,10 +4,8 @@ use anyhow::Result;
 use std::time::Instant;
 use windows::Win32::Foundation::HWND;
 
-use crate::config::Profile;
+use crate::config::{Profile, TitleContext, expand_title};
 use crate::process::NeovideProcess;
-
-
 
 /// Represents a single tab with its associated Neovide process
 pub struct Tab {
@@ -21,12 +19,15 @@ pub struct Tab {
     /// Profile icon filename
     pub profile_icon: String,
     /// Profile working directory (for tooltip display)
-    #[allow(dead_code)]
     pub working_directory: std::path::PathBuf,
     /// Profile index in the config (for reference)
     pub profile_index: usize,
     /// Timestamp when graceful close was requested (for timeout tracking)
     pub close_requested_at: Option<Instant>,
+    /// Tab title format string (from profile, e.g., "%t", "%p: %w")
+    pub title_format: String,
+    /// Cached expanded tab title (computed from title_format)
+    pub cached_title: String,
 }
 
 /// State for tab drag-and-drop reordering
@@ -132,6 +133,9 @@ impl TabManager {
             Some(profile.working_directory.as_path()),
         )?;
 
+        // Initialize with profile name as cached title (will be updated when Neovide window is ready)
+        let initial_title = profile.name.clone();
+
         let tab = Tab {
             id: self.next_id,
             process,
@@ -140,6 +144,8 @@ impl TabManager {
             working_directory: profile.working_directory.clone(),
             profile_index,
             close_requested_at: None,
+            title_format: profile.title.clone(),
+            cached_title: initial_title,
         };
         self.next_id += 1;
 
@@ -169,6 +175,8 @@ impl TabManager {
             working_directory: dirs::home_dir().unwrap_or_default(),
             profile_index: 0,
             close_requested_at: None,
+            title_format: crate::config::DEFAULT_TITLE_FORMAT.to_string(),
+            cached_title: "Default".to_string(),
         };
         self.next_id += 1;
 
@@ -181,9 +189,12 @@ impl TabManager {
 
     /// Select a tab by index
     /// Returns true if the selection changed
+    /// Also updates the tab's title when selected
     pub fn select_tab(&mut self, index: usize) -> bool {
         if index < self.tabs.len() && index != self.selected_index {
             self.selected_index = index;
+            // Update the tab title when selected
+            self.update_tab_title(index);
             true
         } else {
             false
@@ -384,13 +395,46 @@ impl TabManager {
         false
     }
 
-    /// Get the label for a tab (profile name)
+    /// Get the label for a tab (cached expanded title)
     pub fn get_tab_label(&self, index: usize) -> String {
         if let Some(tab) = self.tabs.get(index) {
-            tab.profile_name.clone()
+            tab.cached_title.clone()
         } else {
             String::new()
         }
+    }
+
+    /// Update the cached title for a tab by expanding its title format.
+    /// Returns true if the title changed.
+    pub fn update_tab_title(&mut self, index: usize) -> bool {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            let window_title = tab.process.get_window_title();
+            let context = TitleContext {
+                profile_name: &tab.profile_name,
+                working_directory: &tab.working_directory,
+                window_title: &window_title,
+            };
+            let new_title = expand_title(&tab.title_format, &context);
+
+            // If title is empty after expansion (e.g., window not ready), fall back to profile name
+            let final_title = if new_title.is_empty() {
+                tab.profile_name.clone()
+            } else {
+                new_title
+            };
+
+            if final_title != tab.cached_title {
+                tab.cached_title = final_title;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Update the title for the currently selected tab.
+    /// Returns true if the title changed.
+    pub fn update_selected_tab_title(&mut self) -> bool {
+        self.update_tab_title(self.selected_index)
     }
 
     /// Get the profile index for a tab

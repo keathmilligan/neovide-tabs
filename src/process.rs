@@ -309,6 +309,37 @@ impl NeovideProcess {
             }
         }
     }
+
+    /// Get the current window title of the Neovide window.
+    /// Returns an empty string if the window is not yet ready or title cannot be retrieved.
+    pub fn get_window_title(&self) -> String {
+        if let Some(hwnd_raw) = *self.neovide_hwnd.lock().unwrap() {
+            let neovide_hwnd = HWND(hwnd_raw as *mut _);
+            unsafe {
+                // Check if window is still valid
+                if !IsWindow(neovide_hwnd).as_bool() {
+                    return String::new();
+                }
+
+                // Get the length of the window title
+                let len = GetWindowTextLengthW(neovide_hwnd);
+                if len == 0 {
+                    return String::new();
+                }
+
+                // Allocate buffer and get the title
+                let mut buffer: Vec<u16> = vec![0; (len + 1) as usize];
+                let copied = GetWindowTextW(neovide_hwnd, &mut buffer);
+                if copied == 0 {
+                    return String::new();
+                }
+
+                String::from_utf16_lossy(&buffer[..copied as usize])
+            }
+        } else {
+            String::new()
+        }
+    }
 }
 
 impl Drop for NeovideProcess {

@@ -2575,7 +2575,7 @@ unsafe extern "system" fn window_proc(
                     }
                 }
             } else if wparam.0 == PROCESS_POLL_TIMER_ID {
-                // Poll for exited Neovide processes
+                // Poll for exited Neovide processes and refresh tab title
                 let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
                 if !state_ptr.is_null() {
                     let state = &mut *state_ptr;
@@ -2602,6 +2602,11 @@ unsafe extern "system" fn window_proc(
                             state.tab_manager.activate_selected(hwnd, TITLEBAR_HEIGHT);
                             state.tab_manager.continue_close_sequence();
                         }
+                    }
+
+                    // Periodically refresh the selected tab's title (for %t token updates)
+                    if !should_close && state.tab_manager.update_selected_tab_title() {
+                        needs_repaint = true;
                     }
 
                     if should_close {
