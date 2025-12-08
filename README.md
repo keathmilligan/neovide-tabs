@@ -4,7 +4,7 @@
 
 A lightweight Windows application that provides a tabbed interface to manage multiple [Neovide](https://neovide.dev) instances.
 
-![neovide-tabs screenshot](screenshot.png?v=1)
+![neovide-tabs screenshot](screenshot.png?v=2)
 
 ## Overview
 
@@ -27,6 +27,8 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 - **Process Polling**: Automatic detection and handling of Neovide process exits
 - **Neovide Detection**: Validates Neovide installation at startup with helpful error messages
 - **Debug Utilities**: `list-windows` command for troubleshooting window detection
+
+![neovide-tabs screenshot](screenshot2.png?v=1)
 
 ## Prerequisites
 
