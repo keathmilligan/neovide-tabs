@@ -1,0 +1,113 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  WiX v5 MSI Package for neovide-tabs
+  
+  Build with: wix build Package.wxs -o neovide-tabs.msi -d ProductVersion=1.0.0
+  
+  Features:
+  - Per-user or per-machine installation (user choice)
+  - Start menu shortcut
+  - Add/Remove Programs entry with icon
+  - Does NOT manage config directory (~/.config/neovide-tabs/)
+-->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+
+  <!-- Package metadata -->
+  <Package Name="Neovide Tabs"
+           Manufacturer="Keath Milligan"
+           Version="$(ProductVersion)"
+           UpgradeCode="f8a3b2c1-4d5e-6f7a-8b9c-0d1e2f3a4b5c"
+           Scope="perUserOrMachine">
+
+    <!-- Allow major upgrades, prevent downgrades -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <!-- Embed cabinet in MSI for single-file distribution -->
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Icon for Add/Remove Programs -->
+    <Icon Id="ProductIcon" SourceFile="neovide-tabs.ico" />
+    <Property Id="ARPPRODUCTICON" Value="ProductIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/keathmilligan/neovide-tabs" />
+
+    <!-- Required properties for WixUI_Advanced -->
+    <Property Id="ApplicationFolderName" Value="neovide-tabs" />
+    <Property Id="WixAppFolder" Value="WixPerUserFolder" />
+
+    <!-- 
+      Prerequisites reminder shown on completion dialog.
+      WiX cannot reliably search the full PATH (system + user), so we show a warning instead of blocking.
+    -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" 
+              Value="IMPORTANT: Neovide Tabs requires both Neovim (nvim.exe) and Neovide (neovide.exe) to be installed and available in your system PATH. Please ensure both are installed before running Neovide Tabs. Visit https://neovim.io/ and https://neovide.dev/ for installation instructions." />
+
+    <!-- Default installation directory based on scope -->
+    <!-- Per-user: %LOCALAPPDATA%\Programs\neovide-tabs -->
+    <!-- Per-machine: %ProgramFiles%\neovide-tabs -->
+    <StandardDirectory Id="ProgramFilesFolder">
+      <Directory Id="INSTALLFOLDER" Name="neovide-tabs" />
+    </StandardDirectory>
+    
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER_USER" Name="neovide-tabs" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Start menu shortcut directory -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuDir" Name="Neovide Tabs" />
+    </StandardDirectory>
+
+    <!-- Main application component -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <!-- Main executable -->
+      <Component Id="MainExecutable" Guid="a1b2c3d4-e5f6-7890-abcd-ef1234567890">
+        <File Id="NeovideTabsExe" 
+              Source="$(var.BinaryPath)" 
+              KeyPath="yes" />
+      </Component>
+
+      <!-- Icon file installed alongside executable -->
+      <Component Id="IconFile" Guid="c3d4e5f6-a7b8-9012-cdef-345678901234">
+        <File Id="NeovideTabsIco" 
+              Source="neovide-tabs.ico" 
+              KeyPath="yes" />
+      </Component>
+
+      <!-- Start menu shortcut - non-advertised, references installed icon -->
+      <Component Id="StartMenuShortcutComponent" Guid="d4e5f6a7-b8c9-0123-def0-456789012345" Directory="ProgramMenuDir">
+        <Shortcut Id="StartMenuShortcut"
+                  Name="Neovide Tabs"
+                  Description="Tabbed interface for Neovide"
+                  Target="[INSTALLFOLDER]neovide-tabs.exe"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="ProductIcon" />
+        <RemoveFolder Id="RemoveProgramMenuDir" On="uninstall" />
+        <RegistryValue Root="HKCU" 
+                       Key="Software\NeovideTabs" 
+                       Name="StartMenuInstalled" 
+                       Type="integer" 
+                       Value="1" 
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Main feature -->
+    <Feature Id="MainFeature" Title="Neovide Tabs" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+
+    <!-- WixUI Advanced for per-user/per-machine choice -->
+    <ui:WixUI Id="WixUI_Advanced" />
+    
+    <!-- Custom UI appearance -->
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <WixVariable Id="WixUIBannerBmp" Value="WixUIBannerBmp.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="WixUIDialogBmp.bmp" />
+
+  </Package>
+</Wix>

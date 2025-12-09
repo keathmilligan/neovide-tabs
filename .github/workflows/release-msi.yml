@@ -1,0 +1,145 @@
+# .github/workflows/release-msi.yml
+name: Build MSI Installer
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+env:
+  APP_NAME: neovide-tabs
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    permissions:
+      contents: write  # Required for creating GitHub releases
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ── Extract version from tag ──────────────────────────────────
+      - name: Extract version
+        id: version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          # Strip 'v' prefix for MSI version
+          $version = $tag -replace '^v', ''
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+          echo "Version: $version"
+
+      # ── Rust toolchain ────────────────────────────────────────────
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      # ── Install WiX Toolset ───────────────────────────────────────
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix
+          wix extension add WixToolset.UI.wixext
+
+      # ── Verify installer assets exist ─────────────────────────────
+      - name: Verify installer assets
+        shell: pwsh
+        run: |
+          $requiredFiles = @(
+            "installer/neovide-tabs.ico",
+            "installer/WixUIBannerBmp.bmp",
+            "installer/WixUIDialogBmp.bmp",
+            "installer/License.rtf",
+            "installer/Package.wxs"
+          )
+          
+          $missing = @()
+          foreach ($file in $requiredFiles) {
+            if (-not (Test-Path $file)) {
+              $missing += $file
+            }
+          }
+          
+          if ($missing.Count -gt 0) {
+            Write-Host "Missing installer assets:" -ForegroundColor Red
+            $missing | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+            Write-Host ""
+            Write-Host "Run 'scripts/generate-installer-assets.ps1' to generate these files." -ForegroundColor Yellow
+            throw "Missing required installer assets"
+          }
+          
+          Write-Host "All installer assets present" -ForegroundColor Green
+
+      # ── Build MSI ─────────────────────────────────────────────────
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $binaryPath = "$(Get-Location)\target\release\${{ env.APP_NAME }}.exe"
+          $msiPath = "target\installer\${{ env.APP_NAME }}-$version.msi"
+          
+          # Create output directory
+          New-Item -ItemType Directory -Force -Path "target\installer" | Out-Null
+          
+          # Build MSI
+          Push-Location installer
+          wix build Package.wxs `
+            -o "..\$msiPath" `
+            -d ProductVersion=$version `
+            -d "BinaryPath=$binaryPath" `
+            -ext WixToolset.UI.wixext
+          Pop-Location
+          
+          if (-not (Test-Path $msiPath)) {
+            throw "MSI build failed - file not created"
+          }
+          
+          echo "MSI_PATH=$msiPath" >> $env:GITHUB_OUTPUT
+          echo "Built: $msiPath"
+        id: build
+
+      # ── Create GitHub Release ─────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/installer/${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}.msi
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Installation
+            
+            Download `${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}.msi` and double-click to install.
+            
+            **Installation options:**
+            - Per-user installation (no admin required)
+            - Per-machine installation (requires admin)
+            
+            **Silent installation:**
+            ```powershell
+            # Per-user (no admin)
+            msiexec /i neovide-tabs-${{ steps.version.outputs.VERSION }}.msi /qn
+            
+            # Per-machine (requires admin)
+            msiexec /i neovide-tabs-${{ steps.version.outputs.VERSION }}.msi /qn ALLUSERS=1
+            ```
+            
+            ### Prerequisites
+            - [Neovide](https://neovide.dev) must be installed and in PATH
+            
+            ---
