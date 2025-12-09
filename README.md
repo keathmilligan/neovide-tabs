@@ -14,7 +14,7 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 
 - **Tab Support**: Create, close, and switch between multiple Neovide instances using tabs
 - **Tab Reordering**: Drag tabs to rearrange their order
-- **Dynamic Tab Titles**: Customizable tab titles with token expansion (profile name, working directory, or Neovide window title)
+- **Dynamic Tab Titles**: Customizable tab titles with token expansion (profile name, working directory, window title, or relative file path)
 - **Global Hotkeys**: System-wide keyboard shortcuts to switch tabs or open profiles from any application
 - **Profile Support**: Configure multiple profiles with custom working directories, icons, hotkeys, and title formats
 - **Custom Icons**: Per-profile PNG icons loaded from `~/.config/neovide-tabs/icons/`
@@ -154,6 +154,10 @@ Configuration is stored at `~/.config/neovide-tabs/config.json`:
   - `working_directory`: Starting directory for Neovide (supports `~` expansion)
   - `hotkey`: (optional) Global hotkey to open/activate this profile (e.g., `"Ctrl+Shift+F1"`)
   - `title`: (optional) Tab title format with token expansion (default: `"%t"`)
+    - `%p` - Profile name
+    - `%w` - Working directory (with `~` for home)
+    - `%t` - Neovide window title
+    - `%f` - Relative file path (extracts path from window title relative to working directory; if the path is not under the working directory, returns the window title as-is)
 - `hotkeys`: (optional) Hotkey configuration:
   - `tab`: Map of tab number to hotkey string (e.g., `{"1": "Ctrl+Shift+1"}`)
 

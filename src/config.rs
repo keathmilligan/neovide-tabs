@@ -83,8 +83,10 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r##"// neovide-tabs configuration file
         //     //   %p - Profile name
         //     //   %w - Working directory (uses ~/xxx for paths under home)
         //     //   %t - Neovide window title (current file/buffer)
+        //     //   %f - Relative file path (path from title relative to working_directory,
+        //     //        or window title as-is if not under working_directory)
         //     // Defaults to "%t" (Neovide window title)
-        //     // Examples: "%t", "%p: %w", "%p - %t"
+        //     // Examples: "%t", "%p: %w", "%p - %t", "%f"
         //     "title": "%t"
         // },
         // {
@@ -110,7 +112,8 @@ struct ProfileFile {
     /// Global hotkey for this profile (optional, e.g., "Ctrl+Shift+F1")
     hotkey: Option<String>,
     /// Tab title format string (optional, defaults to "%t")
-    /// Supports tokens: %p (profile name), %w (working directory), %t (Neovide window title)
+    /// Supports tokens: %p (profile name), %w (working directory), %t (Neovide window title),
+    /// %f (relative file path from window title)
     title: Option<String>,
 }
 
@@ -143,7 +146,7 @@ pub struct Profile {
     pub working_directory: PathBuf,
     /// Global hotkey for this profile (e.g., "Ctrl+Shift+F1")
     pub hotkey: Option<String>,
-    /// Tab title format string (supports %p, %w, %t tokens)
+    /// Tab title format string (supports %p, %w, %t, %f tokens)
     pub title: String,
 }
 
@@ -633,6 +636,7 @@ pub struct TitleContext<'a> {
 /// - `%p` - Profile name
 /// - `%w` - Working directory (with ~ substitution for home directory)
 /// - `%t` - Neovide window title
+/// - `%f` - Relative file path from window title (relative to working directory)
 ///
 /// After expansion, strips leading/trailing whitespace, tabs, and dashes.
 pub fn expand_title(format: &str, context: &TitleContext) -> String {
@@ -660,6 +664,15 @@ pub fn expand_title(format: &str, context: &TitleContext) -> String {
                     't' => {
                         chars.next();
                         result.push_str(context.window_title);
+                    }
+                    'f' => {
+                        chars.next();
+                        let relative_file = extract_relative_file(
+                            context.window_title,
+                            context.working_directory,
+                            home_dir.as_deref(),
+                        );
+                        result.push_str(&relative_file);
                     }
                     '%' => {
                         // Escape sequence: %% becomes %
@@ -699,6 +712,123 @@ fn format_working_directory(path: &Path, home_dir: Option<&Path>) -> String {
     }
     // Not under home, return full path with forward slashes
     path.to_string_lossy().replace('\\', "/")
+}
+
+/// Extract the relative file path from the window title.
+///
+/// If the window title contains a path string that begins with the working directory,
+/// extracts and returns the relative path to the file. Otherwise returns the window
+/// title as-is.
+///
+/// For example:
+/// - Title: "~/ws/myproj/src/main.rs", Working dir: "~/ws/myproj" -> "src/main.rs"
+/// - Title: "~/other/file.rs", Working dir: "~/ws/myproj" -> "~/other/file.rs"
+/// - Title: "C:/Users/me/proj/src/lib.rs", Working dir: "C:/Users/me/proj" -> "src/lib.rs"
+fn extract_relative_file(
+    window_title: &str,
+    working_directory: &Path,
+    home_dir: Option<&Path>,
+) -> String {
+    if window_title.is_empty() {
+        return String::new();
+    }
+
+    // Normalize the working directory to a string with forward slashes for comparison
+    let wd_normalized = normalize_path_for_comparison(working_directory, home_dir);
+
+    // Try to find a path in the window title
+    // Neovide typically shows the file path, possibly with additional text like " - Neovim"
+    let title_path = extract_path_from_title(window_title);
+
+    // Normalize the extracted path for comparison
+    let title_normalized = normalize_title_path(&title_path, home_dir);
+
+    // Check if the title path starts with the working directory
+    if title_normalized.starts_with(&wd_normalized) {
+        // Extract the relative part
+        let relative = &title_normalized[wd_normalized.len()..];
+        // Strip leading slash if present
+        let relative = relative.strip_prefix('/').unwrap_or(relative);
+        if relative.is_empty() {
+            // The title is exactly the working directory, return title as-is
+            return window_title.to_string();
+        }
+        return relative.to_string();
+    }
+
+    // Path doesn't start with working directory, return title as-is
+    window_title.to_string()
+}
+
+/// Normalize a Path to a string suitable for prefix comparison.
+/// Uses forward slashes and expands ~ notation.
+fn normalize_path_for_comparison(path: &Path, home_dir: Option<&Path>) -> String {
+    let path_str = path.to_string_lossy();
+    // Convert backslashes to forward slashes
+    let normalized = path_str.replace('\\', "/");
+    // Remove trailing slash if present
+    let normalized = normalized.strip_suffix('/').unwrap_or(&normalized);
+
+    // If we have a home directory, represent it with ~
+    if let Some(home) = home_dir {
+        let home_str = home.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with(&home_str) {
+            let after_home = &normalized[home_str.len()..];
+            if after_home.is_empty() {
+                return "~".to_string();
+            }
+            if after_home.starts_with('/') {
+                return format!("~{}", after_home);
+            }
+        }
+    }
+
+    normalized.to_string()
+}
+
+/// Normalize a title path string for comparison.
+/// Handles ~ expansion and forward/backslash normalization.
+fn normalize_title_path(title_path: &str, home_dir: Option<&Path>) -> String {
+    // Convert backslashes to forward slashes
+    let normalized = title_path.replace('\\', "/");
+
+    // If the path starts with ~, keep it as-is for comparison
+    if normalized.starts_with('~') {
+        return normalized;
+    }
+
+    // If we have a home directory, check if the path is under it
+    if let Some(home) = home_dir {
+        let home_str = home.to_string_lossy().replace('\\', "/");
+        if normalized.starts_with(&home_str) {
+            let after_home = &normalized[home_str.len()..];
+            if after_home.is_empty() {
+                return "~".to_string();
+            }
+            if after_home.starts_with('/') {
+                return format!("~{}", after_home);
+            }
+        }
+    }
+
+    normalized
+}
+
+/// Extract the path portion from a window title.
+/// Neovide titles may include additional text like " - Neovim" after the path.
+fn extract_path_from_title(title: &str) -> String {
+    // Common suffixes that Neovide might add
+    let suffixes = [" - Neovim", " - nvim", " - Neovide"];
+
+    let mut result = title;
+    for suffix in &suffixes {
+        if let Some(pos) = result.rfind(suffix) {
+            result = &result[..pos];
+            break;
+        }
+    }
+
+    result.trim().to_string()
 }
 
 /// Strip leading and trailing whitespace, tabs, and dash characters from a title.
@@ -1345,5 +1475,161 @@ mod tests {
     fn test_default_profile_has_title() {
         let profile = Profile::default_profile();
         assert_eq!(profile.title, DEFAULT_TITLE_FORMAT);
+    }
+
+    // Tests for %f token (relative file path extraction)
+
+    #[test]
+    fn test_expand_title_relative_file_under_working_dir() {
+        let home = dirs::home_dir().unwrap();
+        let working_dir = home.join("ws").join("myproj");
+        let title = format!("~/{} - Neovim", "ws/myproj/src/main.rs");
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &working_dir,
+            window_title: &title,
+        };
+        let result = expand_title("%f", &context);
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_expand_title_relative_file_not_under_working_dir() {
+        let home = dirs::home_dir().unwrap();
+        let working_dir = home.join("ws").join("myproj");
+        let title = "~/other/project/file.rs - Neovim";
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &working_dir,
+            window_title: title,
+        };
+        let result = expand_title("%f", &context);
+        // Should return title as-is when path is not under working directory
+        assert_eq!(result, "~/other/project/file.rs - Neovim");
+    }
+
+    #[test]
+    fn test_expand_title_relative_file_empty_title() {
+        let home = dirs::home_dir().unwrap();
+        let working_dir = home.join("ws").join("myproj");
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &working_dir,
+            window_title: "",
+        };
+        let result = expand_title("%f", &context);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_expand_title_relative_file_exact_working_dir() {
+        let home = dirs::home_dir().unwrap();
+        let working_dir = home.join("ws").join("myproj");
+        let title = "~/ws/myproj - Neovim";
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &working_dir,
+            window_title: title,
+        };
+        let result = expand_title("%f", &context);
+        // When title is exactly the working directory, return title as-is
+        assert_eq!(result, "~/ws/myproj - Neovim");
+    }
+
+    #[test]
+    fn test_expand_title_relative_file_nested_path() {
+        let home = dirs::home_dir().unwrap();
+        let working_dir = home.join("projects").join("myapp");
+        let title = "~/projects/myapp/src/components/Button.tsx - Neovim";
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &working_dir,
+            window_title: title,
+        };
+        let result = expand_title("%f", &context);
+        assert_eq!(result, "src/components/Button.tsx");
+    }
+
+    #[test]
+    fn test_expand_title_relative_file_without_neovim_suffix() {
+        let home = dirs::home_dir().unwrap();
+        let working_dir = home.join("ws").join("myproj");
+        let title = "~/ws/myproj/src/main.rs";
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &working_dir,
+            window_title: title,
+        };
+        let result = expand_title("%f", &context);
+        assert_eq!(result, "src/main.rs");
+    }
+
+    #[test]
+    fn test_expand_title_relative_file_combined_with_profile() {
+        let home = dirs::home_dir().unwrap();
+        let working_dir = home.join("ws").join("myproj");
+        let title = "~/ws/myproj/src/lib.rs - Neovim";
+        let context = TitleContext {
+            profile_name: "Work",
+            working_directory: &working_dir,
+            window_title: title,
+        };
+        let result = expand_title("%p: %f", &context);
+        assert_eq!(result, "Work: src/lib.rs");
+    }
+
+    #[test]
+    fn test_extract_path_from_title_with_neovim_suffix() {
+        let result = extract_path_from_title("~/path/to/file.rs - Neovim");
+        assert_eq!(result, "~/path/to/file.rs");
+    }
+
+    #[test]
+    fn test_extract_path_from_title_with_nvim_suffix() {
+        let result = extract_path_from_title("~/path/to/file.rs - nvim");
+        assert_eq!(result, "~/path/to/file.rs");
+    }
+
+    #[test]
+    fn test_extract_path_from_title_with_neovide_suffix() {
+        let result = extract_path_from_title("~/path/to/file.rs - Neovide");
+        assert_eq!(result, "~/path/to/file.rs");
+    }
+
+    #[test]
+    fn test_extract_path_from_title_no_suffix() {
+        let result = extract_path_from_title("~/path/to/file.rs");
+        assert_eq!(result, "~/path/to/file.rs");
+    }
+
+    #[test]
+    fn test_normalize_path_for_comparison() {
+        let home = dirs::home_dir().unwrap();
+        let path = home.join("projects").join("myapp");
+        let result = normalize_path_for_comparison(&path, Some(&home));
+        assert_eq!(result, "~/projects/myapp");
+    }
+
+    #[test]
+    fn test_normalize_path_for_comparison_home_only() {
+        let home = dirs::home_dir().unwrap();
+        let result = normalize_path_for_comparison(&home, Some(&home));
+        assert_eq!(result, "~");
+    }
+
+    #[test]
+    fn test_normalize_title_path_with_tilde() {
+        let home = dirs::home_dir().unwrap();
+        let result = normalize_title_path("~/projects/myapp", Some(&home));
+        assert_eq!(result, "~/projects/myapp");
+    }
+
+    #[test]
+    fn test_normalize_title_path_absolute() {
+        let home = dirs::home_dir().unwrap();
+        let home_str = home.to_string_lossy().replace('\\', "/");
+        let input = format!("{}/projects/myapp", home_str);
+        let result = normalize_title_path(&input, Some(&home));
+        assert_eq!(result, "~/projects/myapp");
     }
 }
