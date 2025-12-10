@@ -26,12 +26,7 @@ neovide-tabs provides a native wrapper window for Neovide by embedding a framele
 
 ## Installation
 
-Download the latest MSI installer from the [Releases](https://github.com/keathmilligan/neovide-tabs/releases) page.
-
-The installer provides:
-- Per-user installation (no admin required) or per-machine installation
-- Start menu shortcut
-- Easy uninstall via Windows Settings > Apps
+Download the latest MSI installer from the [Releases](https://github.com/keathmilligan/neovide-tabs/releases) page. Check your downloads list, you may need to select "Keep" or "Download Anyway".
 
 Launch the installer.
 

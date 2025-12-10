@@ -38,5 +38,4 @@ Keep this managed block so 'openspec update' can refresh the instructions.
 - **Safety**: Avoid `unsafe` unless absolutely necessary. Document safety invariants thoroughly.
 
 ## Platform Considerations
-- This project targets Windows, Linux, and macOS. Test platform-specific code with `#[cfg(target_os = "...")]`.
 - Use `std::path::Path` and `PathBuf` for cross-platform path handling, never hardcode path separators.
